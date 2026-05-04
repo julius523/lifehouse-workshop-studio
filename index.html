@@ -52,7 +52,8 @@
       "react": "https://esm.sh/react@18.3.1",
       "react-dom/client": "https://esm.sh/react-dom@18.3.1/client",
       "lucide-react": "https://esm.sh/lucide-react@0.383.0?deps=react@18.3.1",
-      "@supabase/supabase-js": "https://esm.sh/@supabase/supabase-js@2.45.4"
+      "@supabase/supabase-js": "https://esm.sh/@supabase/supabase-js@2.45.4",
+      "pptxgenjs": "https://esm.sh/pptxgenjs@3.12.0"
     }
   }
   </script>
@@ -73,6 +74,35 @@
     @media print {
       #boot { display: none !important; }
       header, footer, .print\:hidden { display: none !important; }
+    }
+
+    /* ---- PRESENTATION PRINT MODE (triggered via .lh-printing on <body>) ---- */
+    /* When body.lh-printing is set, only #lh-print-region is visible, sized for landscape paper. */
+    @page lh-landscape {
+      size: 11in 8.5in landscape;
+      margin: 0;
+    }
+    body.lh-printing { background: white !important; }
+    body.lh-printing #root,
+    body.lh-printing #boot { display: none !important; }
+    body.lh-printing #lh-print-region {
+      display: block !important;
+      position: static !important;
+      width: 100% !important;
+      height: auto !important;
+    }
+    #lh-print-region { display: none; }
+    @media print {
+      body.lh-printing #lh-print-region { display: block !important; }
+      body.lh-printing #lh-print-region .lh-print-slide {
+        page: lh-landscape;
+        page-break-after: always;
+        break-after: page;
+      }
+      body.lh-printing #lh-print-region .lh-print-slide:last-child {
+        page-break-after: auto;
+        break-after: auto;
+      }
     }
   </style>
 </head>
@@ -100,9 +130,11 @@
       Lock, Mail, LogOut, UserPlus, Cloud, CloudOff, AlertCircle, Loader2, Eye, EyeOff,
       Video, Mic, MicOff, VideoOff, Square, Circle, Upload, Trash2,
       Play, Pause, Monitor, Camera, FileVideo, Download,
-      Image, ImagePlus, ImageOff, ExternalLink
+      Image, ImagePlus, ImageOff, ExternalLink,
+      Share2, Link as LinkIcon, Copy, FileText, Presentation, GripVertical
     } from "lucide-react";
     import { createClient } from "@supabase/supabase-js";
+    import PptxGenJS from "pptxgenjs";
 
     /* ==========================================================================
        SUPABASE CLIENT + AUTH GATE
@@ -4373,6 +4405,22 @@ function collectDeckCredits(deck) {
   return credits;
 }
 
+// Normalize a list item — handles both legacy string items and new {text, level} objects.
+// Returns {text, level} where level is the indent depth (0 = top-level bullet, 1 = sub-bullet, etc.).
+function normalizeItem(item) {
+  if (typeof item === "string") return { text: item, level: 0 };
+  if (item && typeof item === "object") return { text: item.text || "", level: Math.max(0, Math.min(3, item.level || 0)) };
+  return { text: "", level: 0 };
+}
+// Get just the displayable text from an item (for renderers that don't support indenting yet)
+function itemText(item) {
+  return typeof item === "string" ? item : (item?.text || "");
+}
+// Get level (0 if string)
+function itemLevel(item) {
+  return typeof item === "string" ? 0 : Math.max(0, Math.min(3, item?.level || 0));
+}
+
 // =====================================================================
 // LOGO + UI PRIMITIVES
 // =====================================================================
@@ -4547,23 +4595,45 @@ function SlideRender({ slide, deck, presenting }) {
   const k = slide.kind;
   const baseText = presenting ? "text-stone-900" : "text-stone-900";
 
+  // Helper: render a side-image panel for any slide that has slide.image.
+  // Returns null if no image, otherwise an absolutely-positioned panel in upper right.
+  const sideImage = slide.image && k !== "image" && k !== "title" ? (
+    <div className="absolute top-6 right-6 w-32 sm:w-44 md:w-56 z-10 pointer-events-none">
+      <img
+        src={slide.image.thumbUrl || slide.image.previewUrl}
+        alt={slide.image.alt || ""}
+        className="w-full h-auto object-cover rounded-xl shadow-lg ring-1 ring-stone-200"
+        style={{ aspectRatio: "4/3" }}
+        loading="lazy"
+      />
+    </div>
+  ) : null;
+
   if (k === "title") {
     return (
-      <div className="flex flex-col justify-center h-full px-8">
-        <div className="text-xs uppercase tracking-[0.3em] mb-6" style={{ color: BRAND.purple, fontWeight: 600 }}>
-          Life House Reentry · Workshop
-        </div>
-        <h1 style={{ fontFamily: "Fraunces, Georgia, serif", lineHeight: 0.95, letterSpacing: "-0.03em" }} className={`${presenting ? "text-7xl md:text-8xl" : "text-5xl"} font-medium text-stone-900 mb-6`}>
-          {slide.title}
-        </h1>
-        {slide.tagline && (
-          <p style={{ fontFamily: "Fraunces, Georgia, serif", color: BRAND.purpleDeep }} className={`${presenting ? "text-3xl" : "text-xl"} italic max-w-3xl leading-snug`}>
-            {slide.tagline}
-          </p>
+      <div className="flex flex-col justify-center h-full px-8 relative">
+        {slide.image && (
+          <div className="absolute inset-0 overflow-hidden">
+            <img src={slide.image.fullUrl || slide.image.previewUrl} alt={slide.image.alt || ""} className="w-full h-full object-cover" loading="lazy" />
+            <div className="absolute inset-0" style={{ background: "linear-gradient(115deg, rgba(255,252,245,0.97) 0%, rgba(255,252,245,0.75) 55%, rgba(255,252,245,0.4) 100%)" }} />
+          </div>
         )}
-        <div className="mt-12 flex items-center gap-4">
-          <div className="h-px flex-1" style={{ background: BRAND.border }} />
-          <Logo size="sm" />
+        <div className="relative">
+          <div className="text-xs uppercase tracking-[0.3em] mb-6" style={{ color: BRAND.purple, fontWeight: 600 }}>
+            Life House Reentry · Workshop
+          </div>
+          <h1 style={{ fontFamily: "Fraunces, Georgia, serif", lineHeight: 0.95, letterSpacing: "-0.03em" }} className={`${presenting ? "text-7xl md:text-8xl" : "text-5xl"} font-medium text-stone-900 mb-6`}>
+            {slide.title}
+          </h1>
+          {slide.tagline && (
+            <p style={{ fontFamily: "Fraunces, Georgia, serif", color: BRAND.purpleDeep }} className={`${presenting ? "text-3xl" : "text-xl"} italic max-w-3xl leading-snug`}>
+              {slide.tagline}
+            </p>
+          )}
+          <div className="mt-12 flex items-center gap-4">
+            <div className="h-px flex-1" style={{ background: BRAND.border }} />
+            <Logo size="sm" />
+          </div>
         </div>
       </div>
     );
@@ -4571,7 +4641,8 @@ function SlideRender({ slide, deck, presenting }) {
 
   if (k === "why") {
     return (
-      <div className="flex flex-col justify-center h-full px-8">
+      <div className="flex flex-col justify-center h-full px-8 relative">
+        {sideImage}
         <div className="text-xs uppercase tracking-[0.3em] mb-6 font-semibold" style={{ color: BRAND.green }}>Why this matters</div>
         <div className="space-y-8 max-w-4xl">
           <p style={{ fontFamily: "Fraunces, Georgia, serif" }} className={`${presenting ? "text-5xl" : "text-3xl"} font-medium text-stone-900 leading-tight`}>
@@ -4587,22 +4658,31 @@ function SlideRender({ slide, deck, presenting }) {
 
   if (k === "objectives") {
     return (
-      <div className="flex flex-col justify-center h-full px-8">
+      <div className="flex flex-col justify-center h-full px-8 relative">
+        {sideImage}
         <div className="text-xs uppercase tracking-[0.3em] mb-6 font-semibold" style={{ color: BRAND.purple }}>By the end of this hour</div>
         <h2 style={{ fontFamily: "Fraunces, Georgia, serif" }} className={`${presenting ? "text-5xl" : "text-3xl"} font-medium text-stone-900 mb-10 leading-tight`}>
           You will…
         </h2>
         <ul className="space-y-5 max-w-3xl">
-          {(slide.items || []).map((it, i) => (
-            <li key={i} className="flex gap-5 items-start">
-              <span style={{ background: BRAND.green, fontFamily: "Fraunces, Georgia, serif" }} className={`shrink-0 ${presenting ? "w-12 h-12 text-2xl" : "w-9 h-9 text-base"} rounded-full flex items-center justify-center text-white font-medium`}>
-                {i + 1}
-              </span>
-              <span style={{ fontFamily: "Manrope, sans-serif" }} className={`${presenting ? "text-2xl" : "text-lg"} text-stone-800 leading-snug pt-1`}>
-                {renderInline(it)}
-              </span>
-            </li>
-          ))}
+          {(slide.items || []).map((it, i) => {
+            const lvl = itemLevel(it);
+            const txt = itemText(it);
+            return (
+              <li key={i} className="flex gap-5 items-start" style={{ marginLeft: lvl * 32 + "px" }}>
+                {lvl === 0 ? (
+                  <span style={{ background: BRAND.green, fontFamily: "Fraunces, Georgia, serif" }} className={`shrink-0 ${presenting ? "w-12 h-12 text-2xl" : "w-9 h-9 text-base"} rounded-full flex items-center justify-center text-white font-medium`}>
+                    {i + 1}
+                  </span>
+                ) : (
+                  <span className={`shrink-0 mt-3 ${presenting ? "w-3 h-3" : "w-2 h-2"} rounded-full`} style={{ background: BRAND.green, opacity: 1 - lvl * 0.2 }} />
+                )}
+                <span style={{ fontFamily: "Manrope, sans-serif" }} className={`${presenting ? (lvl > 0 ? "text-xl" : "text-2xl") : (lvl > 0 ? "text-base" : "text-lg")} ${lvl > 0 ? "text-stone-600" : "text-stone-800"} leading-snug pt-1`}>
+                  {renderInline(txt)}
+                </span>
+              </li>
+            );
+          })}
         </ul>
       </div>
     );
@@ -4633,7 +4713,8 @@ function SlideRender({ slide, deck, presenting }) {
 
   if (k === "deepdive") {
     return (
-      <div className="flex flex-col justify-center h-full px-8 py-8">
+      <div className="flex flex-col justify-center h-full px-8 py-8 relative">
+        {sideImage}
         <div className="text-xs uppercase tracking-[0.3em] mb-6 font-semibold" style={{ color: BRAND.purple }}>Deep dive</div>
         {slide.title && (
           <h2 style={{ fontFamily: "Fraunces, Georgia, serif" }} className={`${presenting ? "text-5xl" : "text-3xl"} font-medium text-stone-900 mb-8 leading-tight`}>
@@ -4641,14 +4722,18 @@ function SlideRender({ slide, deck, presenting }) {
           </h2>
         )}
         <ul className="space-y-3 max-w-4xl">
-          {(slide.items || []).map((it, i) => (
-            <li key={i} className="flex gap-3 items-start">
-              <span className="shrink-0 mt-2 w-1.5 h-1.5 rounded-full" style={{ background: BRAND.green }} />
-              <span style={{ fontFamily: "Manrope, sans-serif" }} className={`${presenting ? "text-xl" : "text-base"} text-stone-800 leading-snug`}>
-                {renderInline(it)}
-              </span>
-            </li>
-          ))}
+          {(slide.items || []).map((it, i) => {
+            const lvl = itemLevel(it);
+            const txt = itemText(it);
+            return (
+              <li key={i} className="flex gap-3 items-start" style={{ marginLeft: lvl * 28 + "px" }}>
+                <span className={`shrink-0 mt-2 ${lvl === 0 ? "w-1.5 h-1.5 rounded-full" : "w-2 h-px mt-3"}`} style={{ background: BRAND.green, opacity: 1 - lvl * 0.25 }} />
+                <span style={{ fontFamily: "Manrope, sans-serif" }} className={`${presenting ? (lvl > 0 ? "text-lg" : "text-xl") : (lvl > 0 ? "text-sm" : "text-base")} ${lvl > 0 ? "text-stone-600" : "text-stone-800"} leading-snug`}>
+                  {renderInline(txt)}
+                </span>
+              </li>
+            );
+          })}
         </ul>
       </div>
     );
@@ -4679,22 +4764,31 @@ function SlideRender({ slide, deck, presenting }) {
 
   if (k === "discussion") {
     return (
-      <div className="flex flex-col justify-center h-full px-8">
+      <div className="flex flex-col justify-center h-full px-8 relative">
+        {sideImage}
         <div className="text-xs uppercase tracking-[0.3em] mb-6 font-semibold" style={{ color: BRAND.green }}>Discussion</div>
         <h2 style={{ fontFamily: "Fraunces, Georgia, serif" }} className={`${presenting ? "text-5xl" : "text-3xl"} font-medium text-stone-900 mb-10 italic`}>
           {slide.prompt}
         </h2>
         <ul className="space-y-6 max-w-3xl">
-          {(slide.questions || []).map((q, i) => (
-            <li key={i} className="flex gap-5 items-start">
-              <span style={{ fontFamily: "Fraunces, Georgia, serif", color: BRAND.green }} className={`${presenting ? "text-4xl" : "text-2xl"} font-medium leading-none`}>
-                Q{i + 1}.
-              </span>
-              <span style={{ fontFamily: "Fraunces, Georgia, serif" }} className={`${presenting ? "text-3xl" : "text-xl"} text-stone-800 leading-snug italic`}>
-                {q}
-              </span>
-            </li>
-          ))}
+          {(slide.questions || []).map((q, i) => {
+            const lvl = itemLevel(q);
+            const txt = itemText(q);
+            return (
+              <li key={i} className="flex gap-5 items-start" style={{ marginLeft: lvl * 32 + "px" }}>
+                {lvl === 0 ? (
+                  <span style={{ fontFamily: "Fraunces, Georgia, serif", color: BRAND.green }} className={`${presenting ? "text-4xl" : "text-2xl"} font-medium leading-none`}>
+                    Q{i + 1}.
+                  </span>
+                ) : (
+                  <span className="shrink-0 mt-3 w-2 h-px" style={{ background: BRAND.green, opacity: 1 - lvl * 0.25 }} />
+                )}
+                <span style={{ fontFamily: "Fraunces, Georgia, serif" }} className={`${presenting ? (lvl > 0 ? "text-2xl" : "text-3xl") : (lvl > 0 ? "text-lg" : "text-xl")} ${lvl > 0 ? "text-stone-600" : "text-stone-800"} leading-snug italic`}>
+                  {txt}
+                </span>
+              </li>
+            );
+          })}
         </ul>
       </div>
     );
@@ -4748,22 +4842,31 @@ function SlideRender({ slide, deck, presenting }) {
 
   if (k === "worksheet") {
     return (
-      <div className="flex flex-col justify-center h-full px-8">
+      <div className="flex flex-col justify-center h-full px-8 relative">
+        {sideImage}
         <div className="text-xs uppercase tracking-[0.3em] mb-6 font-semibold" style={{ color: BRAND.green }}>1-on-1 hour</div>
         <h2 style={{ fontFamily: "Fraunces, Georgia, serif" }} className={`${presenting ? "text-5xl" : "text-3xl"} font-medium text-stone-900 mb-10 leading-tight`}>
           {slide.title}
         </h2>
         <ol className="space-y-4 max-w-3xl">
-          {(slide.items || []).map((it, i) => (
-            <li key={i} className="flex gap-5 items-start">
-              <span style={{ background: BRAND.green, color: "white", fontFamily: "Manrope, sans-serif" }} className={`shrink-0 ${presenting ? "w-10 h-10 text-lg" : "w-8 h-8 text-sm"} rounded-md flex items-center justify-center font-semibold`}>
-                {String(i + 1).padStart(2, "0")}
-              </span>
-              <span style={{ fontFamily: "Manrope, sans-serif" }} className={`${presenting ? "text-xl" : "text-base"} text-stone-800 leading-snug pt-1`}>
-                {renderInline(it)}
-              </span>
-            </li>
-          ))}
+          {(slide.items || []).map((it, i) => {
+            const lvl = itemLevel(it);
+            const txt = itemText(it);
+            return (
+              <li key={i} className="flex gap-5 items-start" style={{ marginLeft: lvl * 28 + "px" }}>
+                {lvl === 0 ? (
+                  <span style={{ background: BRAND.green, color: "white", fontFamily: "Manrope, sans-serif" }} className={`shrink-0 ${presenting ? "w-10 h-10 text-lg" : "w-8 h-8 text-sm"} rounded-md flex items-center justify-center font-semibold`}>
+                    {String(i + 1).padStart(2, "0")}
+                  </span>
+                ) : (
+                  <span className="shrink-0 mt-3 w-2 h-px" style={{ background: BRAND.green, opacity: 1 - lvl * 0.25 }} />
+                )}
+                <span style={{ fontFamily: "Manrope, sans-serif" }} className={`${presenting ? (lvl > 0 ? "text-lg" : "text-xl") : (lvl > 0 ? "text-sm" : "text-base")} ${lvl > 0 ? "text-stone-600" : "text-stone-800"} leading-snug pt-1 whitespace-pre-wrap`}>
+                  {renderInline(txt)}
+                </span>
+              </li>
+            );
+          })}
         </ol>
       </div>
     );
@@ -4771,20 +4874,29 @@ function SlideRender({ slide, deck, presenting }) {
 
   if (k === "outcome") {
     return (
-      <div className="flex flex-col justify-center h-full px-8">
+      <div className="flex flex-col justify-center h-full px-8 relative">
+        {sideImage}
         <div className="text-xs uppercase tracking-[0.3em] mb-6 font-semibold" style={{ color: BRAND.green }}>The outcome</div>
         <h2 style={{ fontFamily: "Fraunces, Georgia, serif" }} className={`${presenting ? "text-5xl" : "text-3xl"} font-medium text-stone-900 mb-10 leading-tight italic`}>
           {slide.title}
         </h2>
         <ul className="space-y-4 max-w-3xl">
-          {(slide.items || []).map((it, i) => (
-            <li key={i} className="flex gap-4 items-start">
-              <Check size={presenting ? 28 : 20} className="shrink-0 mt-1" style={{ color: BRAND.green }} />
-              <span style={{ fontFamily: "Manrope, sans-serif" }} className={`${presenting ? "text-2xl" : "text-lg"} text-stone-800 leading-snug`}>
-                {renderInline(it)}
-              </span>
-            </li>
-          ))}
+          {(slide.items || []).map((it, i) => {
+            const lvl = itemLevel(it);
+            const txt = itemText(it);
+            return (
+              <li key={i} className="flex gap-4 items-start" style={{ marginLeft: lvl * 28 + "px" }}>
+                {lvl === 0 ? (
+                  <Check size={presenting ? 28 : 20} className="shrink-0 mt-1" style={{ color: BRAND.green }} />
+                ) : (
+                  <span className="shrink-0 mt-3 w-2 h-px" style={{ background: BRAND.green, opacity: 1 - lvl * 0.25 }} />
+                )}
+                <span style={{ fontFamily: "Manrope, sans-serif" }} className={`${presenting ? (lvl > 0 ? "text-xl" : "text-2xl") : (lvl > 0 ? "text-base" : "text-lg")} ${lvl > 0 ? "text-stone-600" : "text-stone-800"} leading-snug`}>
+                  {renderInline(txt)}
+                </span>
+              </li>
+            );
+          })}
         </ul>
       </div>
     );
@@ -4793,20 +4905,25 @@ function SlideRender({ slide, deck, presenting }) {
   if (k === "resources") {
     const credits = collectDeckCredits(deck);
     return (
-      <div className="flex flex-col justify-center h-full px-8 py-6 overflow-auto">
+      <div className="flex flex-col justify-center h-full px-8 py-6 overflow-auto relative">
+        {sideImage}
         <div className="text-xs uppercase tracking-[0.3em] mb-6 font-semibold" style={{ color: BRAND.purple }}>Resources</div>
         <h2 style={{ fontFamily: "Fraunces, Georgia, serif" }} className={`${presenting ? "text-5xl" : "text-3xl"} font-medium text-stone-900 mb-8 leading-tight`}>
           Take these with you
         </h2>
         <ul className="space-y-3 max-w-3xl">
-          {(slide.items || []).map((it, i) => (
-            <li key={i} className="flex gap-4 items-start p-4 rounded-xl bg-white border border-stone-200">
-              <Phone size={presenting ? 22 : 16} className="shrink-0 mt-1" style={{ color: BRAND.purple }} />
-              <span style={{ fontFamily: "Manrope, sans-serif" }} className={`${presenting ? "text-xl" : "text-base"} text-stone-800 leading-snug`}>
-                {it}
-              </span>
-            </li>
-          ))}
+          {(slide.items || []).map((it, i) => {
+            const lvl = itemLevel(it);
+            const txt = itemText(it);
+            return (
+              <li key={i} className="flex gap-4 items-start p-4 rounded-xl bg-white border border-stone-200" style={{ marginLeft: lvl * 28 + "px" }}>
+                <Phone size={presenting ? 22 : 16} className="shrink-0 mt-1" style={{ color: BRAND.purple, opacity: 1 - lvl * 0.3 }} />
+                <span style={{ fontFamily: "Manrope, sans-serif" }} className={`${presenting ? "text-xl" : "text-base"} ${lvl > 0 ? "text-stone-600" : "text-stone-800"} leading-snug`}>
+                  {txt}
+                </span>
+              </li>
+            );
+          })}
         </ul>
 
         {credits.length > 0 && (
@@ -4930,25 +5047,77 @@ function SlideEditor({ slide, onChange }) {
   );
 
   // Render an editable list of items. Returns JSX directly (not a component) to preserve input focus across renders.
+  // Supports:
+  //   - Tab to increase indent level (sub-bullet), Shift+Tab to decrease
+  //   - Drag-and-drop to reorder
+  //   - Both legacy string items and new {text, level} object items
+  const setItemNorm = (field, idx, next) => {
+    const arr = [...(slide[field] || [])];
+    arr[idx] = next;
+    set(field, arr);
+  };
+  const adjustLevel = (field, idx, delta) => {
+    const arr = [...(slide[field] || [])];
+    const cur = normalizeItem(arr[idx]);
+    cur.level = Math.max(0, Math.min(3, cur.level + delta));
+    arr[idx] = cur;
+    set(field, arr);
+  };
+  const moveItem = (field, fromIdx, toIdx) => {
+    if (fromIdx === toIdx) return;
+    const arr = [...(slide[field] || [])];
+    const [moved] = arr.splice(fromIdx, 1);
+    arr.splice(toIdx, 0, moved);
+    set(field, arr);
+  };
+
   const renderItemList = (field, label, placeholder = "Item") => (
     <div>
-      <label className={labelCls}>{label}</label>
+      <label className={labelCls}>
+        {label}
+        <span className="ml-2 text-stone-400 normal-case font-normal tracking-normal">— Tab to indent · drag to reorder</span>
+      </label>
       <div className="space-y-2">
-        {(slide[field] || []).map((it, i) => (
-          <div key={i} className="flex gap-2">
-            <textarea
-              value={it}
-              onChange={e => setItem(field, i, e.target.value)}
-              placeholder={placeholder}
-              className={`${textCls} min-h-[44px]`}
-              rows={2}
-            />
-            <button onClick={() => removeItem(field, i)} className="p-2 text-stone-400 hover:text-red-500 transition shrink-0">
-              <X size={16} />
-            </button>
-          </div>
-        ))}
-        <button onClick={() => addItem(field)} className="text-sm font-semibold flex items-center gap-1.5 hover:opacity-80" style={{ color: BRAND.purple }}>
+        {(slide[field] || []).map((it, i) => {
+          const norm = normalizeItem(it);
+          return (
+            <div
+              key={i}
+              className="flex gap-2 items-start group"
+              style={{ marginLeft: norm.level * 24 + "px" }}
+              draggable
+              onDragStart={e => {
+                e.dataTransfer.effectAllowed = "move";
+                e.dataTransfer.setData("text/plain", String(i));
+              }}
+              onDragOver={e => { e.preventDefault(); e.dataTransfer.dropEffect = "move"; }}
+              onDrop={e => {
+                e.preventDefault();
+                const from = parseInt(e.dataTransfer.getData("text/plain"), 10);
+                if (!isNaN(from)) moveItem(field, from, i);
+              }}
+            >
+              <span className="cursor-grab active:cursor-grabbing pt-3 text-stone-300 group-hover:text-stone-500 select-none" title="Drag to reorder">⋮⋮</span>
+              <textarea
+                value={norm.text}
+                onChange={e => setItemNorm(field, i, { text: e.target.value, level: norm.level })}
+                onKeyDown={e => {
+                  if (e.key === "Tab") {
+                    e.preventDefault();
+                    adjustLevel(field, i, e.shiftKey ? -1 : 1);
+                  }
+                }}
+                placeholder={placeholder}
+                className={`${textCls} min-h-[44px] flex-1`}
+                rows={2}
+              />
+              <button onClick={() => removeItem(field, i)} className="p-2 text-stone-400 hover:text-red-500 transition shrink-0" title="Delete">
+                <X size={16} />
+              </button>
+            </div>
+          );
+        })}
+        <button onClick={() => addItem(field, { text: "", level: 0 })} className="text-sm font-semibold flex items-center gap-1.5 hover:opacity-80" style={{ color: BRAND.purple }}>
           + Add item
         </button>
       </div>
@@ -4979,7 +5148,6 @@ function SlideEditor({ slide, onChange }) {
         <>
           <div><label className={labelCls}>Title</label><input value={slide.title || ""} onChange={e => set("title", e.target.value)} className={inputCls} /></div>
           <div><label className={labelCls}>Body</label><textarea value={slide.body || ""} onChange={e => set("body", e.target.value)} className={textCls} /></div>
-          {renderImageAttach()}
         </>
       )}
       {(k === "deepdive") && (
@@ -4992,7 +5160,6 @@ function SlideEditor({ slide, onChange }) {
         <>
           <div><label className={labelCls}>Person (name, age)</label><input value={slide.name || ""} onChange={e => set("name", e.target.value)} className={inputCls} /></div>
           <div><label className={labelCls}>Scenario</label><textarea value={slide.scenario || ""} onChange={e => set("scenario", e.target.value)} className={`${textCls} min-h-[140px]`} /></div>
-          {renderImageAttach()}
         </>
       )}
       {(k === "discussion") && (
@@ -5005,7 +5172,6 @@ function SlideEditor({ slide, onChange }) {
         <>
           <div><label className={labelCls}>Title</label><input value={slide.title || ""} onChange={e => set("title", e.target.value)} className={inputCls} /></div>
           <div><label className={labelCls}>Instructions</label><textarea value={slide.instructions || ""} onChange={e => set("instructions", e.target.value)} className={`${textCls} min-h-[120px]`} /></div>
-          {renderImageAttach()}
         </>
       )}
       {(k === "image") && renderImageEditor()}
@@ -5022,6 +5188,9 @@ function SlideEditor({ slide, onChange }) {
         </>
       )}
       {(k === "resources") && renderItemList("items", "Resources", "Resource: phone / website")}
+
+      {/* Image attach available on every slide type EXCEPT the dedicated image kind (which has its own picker) */}
+      {k !== "image" && renderImageAttach()}
 
       {showImageSearch && (
         <ImageSearchModal
@@ -5231,9 +5400,9 @@ function WorksheetView({ deck, onClose }) {
                 <h3 style={{ fontFamily: "Fraunces, Georgia, serif" }} className="text-xl font-medium text-stone-900 mb-4">By the end of this hour, you will…</h3>
                 <ul className="space-y-2" style={{ fontFamily: "Manrope, sans-serif" }}>
                   {objSlide.items.map((it, i) => (
-                    <li key={i} className="flex gap-3 text-stone-700">
+                    <li key={i} className="flex gap-3 text-stone-700" style={{ marginLeft: itemLevel(it) * 20 + "px" }}>
                       <span className="w-5 h-5 border-2 border-stone-300 rounded mt-0.5 shrink-0" />
-                      <span>{renderInline(it)}</span>
+                      <span>{renderInline(itemText(it))}</span>
                     </li>
                   ))}
                 </ul>
@@ -5246,10 +5415,10 @@ function WorksheetView({ deck, onClose }) {
                 <p className="text-xs uppercase tracking-widest text-stone-400 mb-5 font-semibold">Your one-on-one hour</p>
                 <ol className="space-y-6" style={{ fontFamily: "Manrope, sans-serif" }}>
                   {worksheetSlide.items.map((it, i) => (
-                    <li key={i}>
+                    <li key={i} style={{ marginLeft: itemLevel(it) * 20 + "px" }}>
                       <div className="flex gap-3 items-start mb-3">
                         <span className="shrink-0 w-7 h-7 rounded-md flex items-center justify-center text-white text-xs font-bold" style={{ background: BRAND.green }}>{i + 1}</span>
-                        <span className="text-stone-800 leading-snug pt-0.5">{renderInline(it)}</span>
+                        <span className="text-stone-800 leading-snug pt-0.5 whitespace-pre-wrap">{renderInline(itemText(it))}</span>
                       </div>
                       <div className="ml-10 space-y-2">
                         <div className="border-b border-stone-200 h-7"></div>
@@ -5274,9 +5443,9 @@ function WorksheetView({ deck, onClose }) {
                 <h3 style={{ fontFamily: "Fraunces, Georgia, serif" }} className="text-xl font-medium text-stone-900 mb-4 italic">{outcomeSlide.title}</h3>
                 <ul className="space-y-2" style={{ fontFamily: "Manrope, sans-serif" }}>
                   {outcomeSlide.items.map((it, i) => (
-                    <li key={i} className="flex gap-3 text-stone-700">
+                    <li key={i} className="flex gap-3 text-stone-700" style={{ marginLeft: itemLevel(it) * 20 + "px" }}>
                       <Check size={18} style={{ color: BRAND.green }} className="shrink-0 mt-0.5" />
-                      <span>{renderInline(it)}</span>
+                      <span>{renderInline(itemText(it))}</span>
                     </li>
                   ))}
                 </ul>
@@ -5298,7 +5467,7 @@ function WorksheetView({ deck, onClose }) {
 // DECK DETAIL / EDITOR
 // =====================================================================
 
-function DeckView({ deck, deckId, onBack, onPresent, onSave, onReset, isCustom, onDeleteCustom, onShowWorksheet }) {
+function DeckView({ deck, deckId, onBack, onPresent, onSave, onReset, isCustom, onDeleteCustom, onShowWorksheet, onShowExport }) {
   const [activeIdx, setActiveIdx] = useState(0);
   const [editing, setEditing] = useState(false);
   const [showAddMenu, setShowAddMenu] = useState(false);
@@ -5389,6 +5558,10 @@ function DeckView({ deck, deckId, onBack, onPresent, onSave, onReset, isCustom, 
             <button onClick={onShowWorksheet} className="px-4 py-2 rounded-full text-sm font-semibold flex items-center gap-1.5 text-stone-700 bg-stone-100 hover:bg-stone-200 transition" style={{ fontFamily: "Manrope, sans-serif" }}>
               <ClipboardCheck size={14} /> Worksheet
             </button>
+            <button onClick={onShowExport} className="px-4 py-2 rounded-full text-sm font-semibold flex items-center gap-1.5 text-stone-700 bg-stone-100 hover:bg-stone-200 transition" style={{ fontFamily: "Manrope, sans-serif" }} title="Download as PDF or PowerPoint">
+              <Download size={14} /> Download
+            </button>
+            <ShareDeckButton deckId={deckId} />
             {!isCustom && (
               <button onClick={onReset} className="px-4 py-2 rounded-full text-sm font-semibold flex items-center gap-1.5 text-stone-500 hover:text-stone-900 transition" style={{ fontFamily: "Manrope, sans-serif" }} title="Reset to original">
                 <RotateCcw size={14} /> Reset
@@ -5412,19 +5585,39 @@ function DeckView({ deck, deckId, onBack, onPresent, onSave, onReset, isCustom, 
         <div className="w-72 shrink-0 border-r border-stone-200 overflow-auto" style={{ background: BRAND.paper }}>
           <div className="p-4 space-y-2">
             {deck.slides.map((s, i) => (
-              <button
+              <div
                 key={i}
-                onClick={() => setActiveIdx(i)}
-                className={`w-full text-left p-3 rounded-xl transition border-2 ${i === activeIdx ? "bg-white border-stone-900" : "bg-stone-50 hover:bg-stone-100 border-transparent"}`}
+                draggable={editing}
+                onDragStart={editing ? (e) => {
+                  e.dataTransfer.effectAllowed = "move";
+                  e.dataTransfer.setData("text/plain", String(i));
+                } : undefined}
+                onDragOver={editing ? (e) => { e.preventDefault(); e.dataTransfer.dropEffect = "move"; } : undefined}
+                onDrop={editing ? (e) => {
+                  e.preventDefault();
+                  const from = parseInt(e.dataTransfer.getData("text/plain"), 10);
+                  if (isNaN(from) || from === i) return;
+                  const slides = [...deck.slides];
+                  const [moved] = slides.splice(from, 1);
+                  slides.splice(i, 0, moved);
+                  onSave({ ...deck, slides });
+                  setActiveIdx(i);
+                } : undefined}
               >
-                <div className="flex items-center gap-2 mb-1">
-                  <span className="text-[10px] font-bold text-stone-400 tracking-widest" style={{ fontFamily: "Manrope, sans-serif" }}>{String(i + 1).padStart(2, "0")}</span>
-                  <span className="text-[10px] font-semibold uppercase tracking-wider" style={{ color: cat.accent }}>{SLIDE_KIND_LABELS[s.kind]}</span>
-                </div>
-                <div style={{ fontFamily: "Fraunces, Georgia, serif" }} className="text-sm text-stone-800 leading-snug line-clamp-2">
-                  {s.title || s.hook || s.name || s.prompt || (s.items && s.items[0]) || s.body || "(empty)"}
-                </div>
-              </button>
+                <button
+                  onClick={() => setActiveIdx(i)}
+                  className={`w-full text-left p-3 rounded-xl transition border-2 ${i === activeIdx ? "bg-white border-stone-900" : "bg-stone-50 hover:bg-stone-100 border-transparent"} ${editing ? "cursor-grab active:cursor-grabbing" : ""}`}
+                >
+                  <div className="flex items-center gap-2 mb-1">
+                    {editing && <span className="text-stone-300" title="Drag to reorder">⋮⋮</span>}
+                    <span className="text-[10px] font-bold text-stone-400 tracking-widest" style={{ fontFamily: "Manrope, sans-serif" }}>{String(i + 1).padStart(2, "0")}</span>
+                    <span className="text-[10px] font-semibold uppercase tracking-wider" style={{ color: cat.accent }}>{SLIDE_KIND_LABELS[s.kind]}</span>
+                  </div>
+                  <div style={{ fontFamily: "Fraunces, Georgia, serif" }} className="text-sm text-stone-800 leading-snug line-clamp-2">
+                    {s.title || s.hook || s.name || s.prompt || (s.items && itemText(s.items[0])) || s.body || "(empty)"}
+                  </div>
+                </button>
+              </div>
             ))}
             {editing && (
               <div className="pt-2 relative">
@@ -5675,6 +5868,302 @@ function TeamPanel({ onClose }) {
         </div>
       </div>
     </div>
+  );
+}
+
+// ---------------------------------------------------------------------
+// PRINT REGION — renders the deck for window.print() in landscape format
+// Hidden by default; only visible when body has class "lh-printing"
+// ---------------------------------------------------------------------
+function PrintRegion({ deck }) {
+  if (!deck) return null;
+  return (
+    <div id="lh-print-region">
+      {deck.slides.map((slide, i) => (
+        <div
+          key={i}
+          className="lh-print-slide"
+          style={{
+            width: "11in",
+            height: "8.5in",
+            background: "white",
+            position: "relative",
+            overflow: "hidden",
+            color: "#1A1410",
+            fontFamily: "Manrope, sans-serif",
+            display: "block"
+          }}
+        >
+          <div style={{ width: "100%", height: "100%", position: "relative" }}>
+            <SlideRender slide={slide} deck={deck} presenting={true} />
+          </div>
+          {/* Footer with page number */}
+          <div style={{
+            position: "absolute", bottom: "0.2in", left: "0.4in", right: "0.4in",
+            display: "flex", justifyContent: "space-between", alignItems: "center",
+            fontSize: "9px", color: "#9A8E80", letterSpacing: "0.1em", textTransform: "uppercase"
+          }}>
+            <span>{deck.title}</span>
+            <span>{i + 1} / {deck.slides.length}</span>
+          </div>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+// =====================================================================
+// EXPORT (Print / PDF / PowerPoint) + SHARE LINK
+// =====================================================================
+
+// Simple flatten for slide text used in PPTX export
+function slideTextDump(slide) {
+  const k = slide.kind;
+  const lines = [];
+  if (slide.title) lines.push({ text: slide.title, role: "title" });
+  if (slide.tagline) lines.push({ text: slide.tagline, role: "tagline" });
+  if (slide.hook) lines.push({ text: slide.hook, role: "hook" });
+  if (slide.body) lines.push({ text: slide.body, role: "body" });
+  if (slide.name) lines.push({ text: slide.name, role: "name" });
+  if (slide.scenario) lines.push({ text: slide.scenario, role: "body" });
+  if (slide.prompt) lines.push({ text: slide.prompt, role: "title" });
+  if (slide.instructions) lines.push({ text: slide.instructions, role: "body" });
+  if (slide.caption) lines.push({ text: slide.caption, role: "caption" });
+  const itemArr = slide.items || slide.questions || [];
+  itemArr.forEach((it) => lines.push({ text: itemText(it), role: "bullet", level: itemLevel(it) }));
+  return lines;
+}
+
+// Build a downloadable .pptx and trigger save
+async function exportToPptx(deck, deckTitle) {
+  const pptx = new PptxGenJS();
+  pptx.layout = "LAYOUT_WIDE"; // 13.33 x 7.5
+  pptx.title = deckTitle;
+  pptx.author = "Life House Reentry";
+  pptx.company = "Life House Reentry";
+
+  const PURPLE = "5B2D8A";
+  const PURPLE_DEEP = "3E1E62";
+  const GREEN = "1FAE7C";
+  const CREAM = "FAF6EE";
+  const INK = "1A1410";
+  const STONE = "6B6056";
+
+  for (const slide of deck.slides) {
+    const s = pptx.addSlide();
+    s.background = { color: "FFFFFF" };
+    const k = slide.kind;
+    const dump = slideTextDump(slide);
+
+    // Side image (if present, except for image-kind which goes full)
+    let textWidth = 12.5;
+    if (slide.image && k !== "image" && k !== "title") {
+      try {
+        s.addImage({
+          path: slide.image.fullUrl || slide.image.previewUrl,
+          x: 9.5, y: 0.5, w: 3.3, h: 2.5,
+          rounding: true
+        });
+        textWidth = 8.5;
+      } catch (e) { /* skip image on err */ }
+    }
+
+    // Title-kind: hero with image background
+    if (k === "title") {
+      if (slide.image) {
+        try {
+          s.addImage({ path: slide.image.fullUrl || slide.image.previewUrl, x: 0, y: 0, w: 13.33, h: 7.5 });
+          // light overlay
+          s.addShape(pptx.ShapeType.rect, { x: 0, y: 0, w: 13.33, h: 7.5, fill: { color: CREAM, transparency: 15 }, line: { type: "none" } });
+        } catch (e) {}
+      }
+      s.addText("LIFE HOUSE REENTRY · WORKSHOP", { x: 0.5, y: 1.6, w: 12, h: 0.4, fontFace: "Manrope", fontSize: 10, color: PURPLE, bold: true, charSpacing: 8 });
+      s.addText(slide.title || "Workshop", { x: 0.5, y: 2.1, w: 12, h: 2.3, fontFace: "Fraunces", fontSize: 60, color: INK, bold: false });
+      if (slide.tagline) {
+        s.addText(slide.tagline, { x: 0.5, y: 4.6, w: 11, h: 1, fontFace: "Fraunces", fontSize: 24, italic: true, color: PURPLE_DEEP });
+      }
+      continue;
+    }
+
+    // Image-kind: full slide image
+    if (k === "image") {
+      if (slide.image) {
+        try { s.addImage({ path: slide.image.fullUrl || slide.image.previewUrl, x: 0.5, y: 0.5, w: 12.33, h: 6 }); } catch(e) {}
+      }
+      if (slide.caption) {
+        s.addText(slide.caption, { x: 0.5, y: 6.6, w: 12.33, h: 0.6, fontFace: "Fraunces", fontSize: 18, italic: true, color: STONE, align: "center" });
+      }
+      continue;
+    }
+
+    // Section badge (top of every other slide)
+    const badges = {
+      why: "WHY THIS MATTERS", objectives: "BY THE END OF THIS HOUR",
+      concept: "CONCEPT", deepdive: "DEEP DIVE", case: "CASE STUDY",
+      discussion: "DISCUSSION", activity: "ACTIVITY — TOGETHER",
+      worksheet: "1-ON-1 HOUR", outcome: "THE OUTCOME", resources: "RESOURCES"
+    };
+    if (badges[k]) {
+      s.addText(badges[k], { x: 0.5, y: 0.45, w: 8, h: 0.35, fontFace: "Manrope", fontSize: 11, color: GREEN, bold: true, charSpacing: 6 });
+    }
+
+    // Title / heading
+    let yPos = 1.0;
+    const titleLine = dump.find(l => l.role === "title");
+    if (titleLine && titleLine.text) {
+      s.addText(titleLine.text, { x: 0.5, y: yPos, w: textWidth, h: 1.0, fontFace: "Fraunces", fontSize: 32, color: INK, bold: false });
+      yPos += 1.2;
+    }
+    const tagLine = dump.find(l => l.role === "tagline");
+    if (tagLine) {
+      s.addText(tagLine.text, { x: 0.5, y: yPos, w: textWidth, h: 0.6, fontFace: "Fraunces", fontSize: 18, italic: true, color: STONE });
+      yPos += 0.7;
+    }
+    const nameLine = dump.find(l => l.role === "name");
+    if (nameLine) {
+      s.addText(nameLine.text, { x: 0.5, y: yPos, w: textWidth, h: 0.6, fontFace: "Fraunces", fontSize: 22, italic: true, color: PURPLE_DEEP });
+      yPos += 0.7;
+    }
+    const hookLine = dump.find(l => l.role === "hook");
+    if (hookLine) {
+      s.addText(`"${hookLine.text}"`, { x: 0.5, y: yPos, w: textWidth, h: 1.5, fontFace: "Fraunces", fontSize: 28, color: INK });
+      yPos += 1.6;
+    }
+    dump.filter(l => l.role === "body").forEach(b => {
+      s.addText(b.text, { x: 0.5, y: yPos, w: textWidth, h: 1.2, fontFace: "Manrope", fontSize: 16, color: STONE });
+      yPos += 1.3;
+    });
+    const captionLine = dump.find(l => l.role === "caption");
+    if (captionLine) {
+      s.addText(captionLine.text, { x: 0.5, y: yPos, w: textWidth, h: 0.5, fontFace: "Fraunces", fontSize: 14, italic: true, color: STONE });
+      yPos += 0.6;
+    }
+
+    // Bullets
+    const bullets = dump.filter(l => l.role === "bullet");
+    if (bullets.length > 0) {
+      const bulletLines = bullets.map(b => ({
+        text: b.text,
+        options: {
+          bullet: { code: b.level === 0 ? "25CF" : "25E6" },
+          indentLevel: b.level || 0,
+          paraSpaceBefore: 4
+        }
+      }));
+      s.addText(bulletLines, {
+        x: 0.5, y: yPos, w: textWidth, h: 7.5 - yPos - 0.5,
+        fontFace: "Manrope", fontSize: 14, color: INK, valign: "top"
+      });
+    }
+
+    // Footer
+    s.addText("LIFE HOUSE REENTRY · workshops.lifehousereentry.com", {
+      x: 0.5, y: 7.1, w: 12, h: 0.3, fontFace: "Manrope", fontSize: 8, color: STONE, charSpacing: 4
+    });
+  }
+
+  await pptx.writeFile({ fileName: `${deckTitle.replace(/[^a-z0-9]/gi, "_")}.pptx` });
+}
+
+// PDF export = open print dialog with print-ready CSS targeting only the print region
+function exportToPdf() {
+  // Add a one-shot class on body that makes the print view appear and triggers the dialog
+  document.body.classList.add("lh-printing");
+  // Give the browser a tick to apply CSS
+  setTimeout(() => {
+    window.print();
+    setTimeout(() => document.body.classList.remove("lh-printing"), 500);
+  }, 100);
+}
+
+// ---------------------------------------------------------------------
+// EXPORT MODAL
+// ---------------------------------------------------------------------
+function ExportModal({ deck, onClose }) {
+  const [pptxBusy, setPptxBusy] = useState(false);
+
+  const handlePdf = () => {
+    onClose();
+    setTimeout(exportToPdf, 200);
+  };
+  const handlePptx = async () => {
+    setPptxBusy(true);
+    try {
+      await exportToPptx(deck, deck.title);
+    } catch (e) {
+      console.error(e);
+      alert("PowerPoint export failed: " + e.message);
+    }
+    setPptxBusy(false);
+  };
+
+  return (
+    <div className="fixed inset-0 z-[60] flex items-center justify-center p-4" style={{ background: "rgba(26,20,16,0.6)" }} onClick={onClose}>
+      <div className="bg-white rounded-3xl w-full max-w-md shadow-2xl" onClick={e => e.stopPropagation()}>
+        <div className="p-7">
+          <div className="flex items-start justify-between mb-2">
+            <h2 style={{ fontFamily: "Fraunces, Georgia, serif" }} className="text-2xl font-medium text-stone-900">Download or print</h2>
+            <button onClick={onClose} className="p-1.5 rounded-full hover:bg-stone-100"><X size={18} /></button>
+          </div>
+          <p className="text-sm text-stone-500 mb-5" style={{ fontFamily: "Manrope, sans-serif" }}>
+            Get this workshop in a format you can share with attendees or print.
+          </p>
+
+          <div className="space-y-2.5">
+            <button onClick={handlePdf} className="w-full text-left p-4 rounded-2xl border-2 border-stone-200 hover:border-stone-900 transition flex items-center gap-4 group">
+              <div className="w-12 h-12 rounded-xl flex items-center justify-center shrink-0" style={{ background: `${BRAND.purpleDeep}15`, color: BRAND.purpleDeep }}>
+                <FileText size={20} />
+              </div>
+              <div className="flex-1">
+                <div className="font-semibold text-stone-900">Save as PDF / Print</div>
+                <div className="text-xs text-stone-500 mt-0.5">Reliable, opens anywhere. Use the print dialog → "Save as PDF" or print on paper.</div>
+              </div>
+              <ArrowRight size={16} className="text-stone-300 group-hover:text-stone-900 transition" />
+            </button>
+
+            <button onClick={handlePptx} disabled={pptxBusy} className="w-full text-left p-4 rounded-2xl border-2 border-stone-200 hover:border-stone-900 transition flex items-center gap-4 group disabled:opacity-60">
+              <div className="w-12 h-12 rounded-xl flex items-center justify-center shrink-0" style={{ background: `${BRAND.amber}20`, color: "#A86A1F" }}>
+                <Presentation size={20} />
+              </div>
+              <div className="flex-1">
+                <div className="font-semibold text-stone-900">Download as PowerPoint</div>
+                <div className="text-xs text-stone-500 mt-0.5">Editable .pptx file. Fonts may shift slightly when opened in PowerPoint.</div>
+              </div>
+              {pptxBusy ? <Loader2 size={16} className="animate-spin text-stone-500" /> : <ArrowRight size={16} className="text-stone-300 group-hover:text-stone-900 transition" />}
+            </button>
+          </div>
+
+          <p className="text-xs text-stone-400 mt-5 leading-relaxed text-center">
+            {deck.slides.length} slides · approx. {Math.ceil(deck.slides.length * 0.06)} MB for PowerPoint
+          </p>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------
+// SHARE BUTTON — copies a deep link to this deck
+// ---------------------------------------------------------------------
+function ShareDeckButton({ deckId }) {
+  const [copied, setCopied] = useState(false);
+  const handle = () => {
+    const link = `${window.location.origin}${window.location.pathname}?deck=${encodeURIComponent(deckId)}`;
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(link).then(() => {
+        setCopied(true);
+        setTimeout(() => setCopied(false), 2000);
+      }).catch(() => {
+        prompt("Copy this link:", link);
+      });
+    } else {
+      prompt("Copy this link:", link);
+    }
+  };
+  return (
+    <button onClick={handle} className="px-4 py-2 rounded-full text-sm font-semibold flex items-center gap-1.5 text-stone-700 bg-stone-100 hover:bg-stone-200 transition" style={{ fontFamily: "Manrope, sans-serif" }} title="Copy a direct link to this workshop">
+      {copied ? <><Check size={14} style={{ color: BRAND.green }} /> Copied!</> : <><Share2 size={14} /> Share</>}
+    </button>
   );
 }
 
@@ -6523,6 +7012,7 @@ function App() {
   const [showWorksheet, setShowWorksheet] = useState(false);
   const [showNewDialog, setShowNewDialog] = useState(false);
   const [showTeamPanel, setShowTeamPanel] = useState(false);
+  const [showExport, setShowExport] = useState(false);
   const [showUserMenu, setShowUserMenu] = useState(false);
   const [search, setSearch] = useState("");
   const [edits, setEdits] = useStorage("lh:edits:v1", {});
@@ -6585,6 +7075,37 @@ function App() {
     document.body.style.background = BRAND.cream;
     document.body.style.fontFamily = "Manrope, ui-sans-serif, system-ui, sans-serif";
   }, []);
+
+  // Deep-link sharing: ?deck=ID opens that deck. Runs once after data is ready.
+  useEffect(() => {
+    const params = new URLSearchParams(window.location.search);
+    const deckParam = params.get("deck");
+    if (!deckParam) return;
+    // Wait until decks are loaded (built-in always available; custom needs the customDecks fetch to finish)
+    const exists = DECKS[deckParam] || customDecks[deckParam];
+    if (exists) {
+      setOpenId(deckParam);
+      setView("deck");
+    }
+    // Don't strip the param — keep it so refreshing keeps the deck open
+  }, [customDecks]);
+
+  // Keep URL in sync when user navigates between catalog and a deck
+  useEffect(() => {
+    const params = new URLSearchParams(window.location.search);
+    if (view === "deck" && openId) {
+      if (params.get("deck") !== openId) {
+        params.set("deck", openId);
+        window.history.replaceState(null, "", window.location.pathname + "?" + params.toString());
+      }
+    } else if (view === "catalog") {
+      if (params.has("deck")) {
+        params.delete("deck");
+        const q = params.toString();
+        window.history.replaceState(null, "", window.location.pathname + (q ? "?" + q : ""));
+      }
+    }
+  }, [view, openId]);
 
   return (
     <div className="min-h-screen flex flex-col" style={{ background: BRAND.cream, fontFamily: "Manrope, sans-serif", color: BRAND.ink }}>
@@ -6672,6 +7193,7 @@ function App() {
             onReset={handleResetDeck}
             onDeleteCustom={handleDeleteCustom}
             onShowWorksheet={() => setShowWorksheet(true)}
+            onShowExport={() => setShowExport(true)}
           />
         )}
       </main>
@@ -6701,6 +7223,10 @@ function App() {
       {showWorksheet && openDeck && <WorksheetView deck={openDeck} onClose={() => setShowWorksheet(false)} />}
       {showNewDialog && <NewCustomDialog onClose={() => setShowNewDialog(false)} onCreate={handleCreateCustom} />}
       {showTeamPanel && <TeamPanel onClose={() => setShowTeamPanel(false)} />}
+      {showExport && openDeck && <ExportModal deck={openDeck} onClose={() => setShowExport(false)} />}
+
+      {/* PRINT REGION — hidden until body.lh-printing is set, then becomes visible for window.print() */}
+      {openDeck && <PrintRegion deck={openDeck} />}
     </div>
   );
 }
