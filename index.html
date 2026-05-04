@@ -50,6 +50,7 @@
   {
     "imports": {
       "react": "https://esm.sh/react@18.3.1",
+      "react-dom": "https://esm.sh/react-dom@18.3.1",
       "react-dom/client": "https://esm.sh/react-dom@18.3.1/client",
       "lucide-react": "https://esm.sh/lucide-react@0.383.0?deps=react@18.3.1",
       "@supabase/supabase-js": "https://esm.sh/@supabase/supabase-js@2.45.4",
@@ -76,28 +77,65 @@
       header, footer, .print\:hidden { display: none !important; }
     }
 
+    /* ---- THEME-AWARE OVERRIDES ----
+       For dark themes (Midnight, Bold), Tailwind's stone-* text colors render too dark.
+       We mark the slide container with data-theme-mode="dark" and override specific
+       text classes inside it. Same for the bg-white inner overlays.
+    */
+    [data-theme-mode="dark"] .text-stone-900,
+    [data-theme-mode="dark"] .text-stone-800 { color: var(--lh-ink, #F5EFE6) !important; }
+    [data-theme-mode="dark"] .text-stone-700,
+    [data-theme-mode="dark"] .text-stone-600 { color: var(--lh-ink-soft, #C7BBD1) !important; }
+    [data-theme-mode="dark"] .text-stone-500 { color: var(--lh-ink-soft, #9C8FAA) !important; }
+    [data-theme-mode="dark"] .bg-white { background: var(--lh-paper, #2A1D3F) !important; }
+
+    /* ---- TRANSITIONS ---- */
+    @keyframes lh-fade-in   { from { opacity: 0 } to { opacity: 1 } }
+    @keyframes lh-slide-in  { from { opacity: 0; transform: translateX(40px) } to { opacity: 1; transform: translateX(0) } }
+    @keyframes lh-zoom-in   { from { opacity: 0; transform: scale(0.94) } to { opacity: 1; transform: scale(1) } }
+    @keyframes lh-flip-in   { from { opacity: 0; transform: perspective(1200px) rotateY(15deg) translateX(30px) } to { opacity: 1; transform: perspective(1200px) rotateY(0) translateX(0) } }
+    @keyframes lh-bullet-in { from { opacity: 0; transform: translateY(8px) } to { opacity: 1; transform: translateY(0) } }
+    .lh-anim-smooth { animation: lh-fade-in 0.45s ease-out; }
+    .lh-anim-lively { animation: lh-zoom-in 0.55s cubic-bezier(0.18, 0.89, 0.32, 1.28); }
+    .lh-bullet-anim { animation: lh-bullet-in 0.4s ease-out backwards; }
+
     /* ---- PRESENTATION PRINT MODE (triggered via .lh-printing on <body>) ---- */
-    /* When body.lh-printing is set, only #lh-print-region is visible, sized for landscape paper. */
+    /* Hide print region by default. Only show during actual printing or when on-screen
+       preview is needed (we keep it hidden on-screen and only let it render at print time). */
     @page lh-landscape {
       size: 11in 8.5in landscape;
       margin: 0;
     }
-    body.lh-printing { background: white !important; }
-    body.lh-printing #root,
-    body.lh-printing #boot { display: none !important; }
-    body.lh-printing #lh-print-region {
-      display: block !important;
-      position: static !important;
-      width: 100% !important;
-      height: auto !important;
+    /* On screen: print region is invisible but still in the DOM (so React keeps it mounted) */
+    #lh-print-region {
+      position: fixed;
+      left: -10000px;
+      top: 0;
+      width: 11in;
+      pointer-events: none;
+      opacity: 0;
     }
-    #lh-print-region { display: none; }
+    /* In print mode (after we add body.lh-printing AND the browser is rendering @media print): */
     @media print {
-      body.lh-printing #lh-print-region { display: block !important; }
+      body.lh-printing { background: white !important; }
+      body.lh-printing #root,
+      body.lh-printing #boot,
+      body.lh-printing > header,
+      body.lh-printing > footer { display: none !important; }
+      body.lh-printing #lh-print-region {
+        position: static !important;
+        left: auto !important;
+        top: auto !important;
+        width: auto !important;
+        opacity: 1 !important;
+        display: block !important;
+      }
       body.lh-printing #lh-print-region .lh-print-slide {
         page: lh-landscape;
         page-break-after: always;
         break-after: page;
+        page-break-inside: avoid;
+        break-inside: avoid;
       }
       body.lh-printing #lh-print-region .lh-print-slide:last-child {
         page-break-after: auto;
@@ -121,6 +159,7 @@
   <script type="text/babel" data-type="module" data-presets="react">
     import React, { useState, useEffect, useRef, useMemo } from "react";
     import { createRoot } from "react-dom/client";
+    import { createPortal } from "react-dom";
     import {
       Home, ChevronLeft, ChevronRight, Edit3, Save, RotateCcw, Printer,
       Search, X, Menu, Check, Sparkles, BookOpen, Users, Heart,
@@ -334,6 +373,156 @@
     const AuthCtx = React.createContext(null);
     const useAuth = () => React.useContext(AuthCtx);
 
+    // ---- PUBLIC VIEWER ----
+    // Read-only view of a published deck. No login required.
+    // Anyone with the ?public=DECK_ID link can view, present, and download.
+    // They cannot edit, share-edit, or delete.
+    function PublicViewer({ deckId }) {
+      const [deck, setDeck] = useState(null);
+      const [error, setError] = useState(null);
+      const [loading, setLoading] = useState(true);
+      const [presenting, setPresenting] = useState(false);
+      const [showExport, setShowExport] = useState(false);
+
+      useEffect(() => {
+        // Add noindex so search engines don't index public decks
+        const meta = document.createElement("meta");
+        meta.name = "robots";
+        meta.content = "noindex, nofollow";
+        document.head.appendChild(meta);
+        return () => { try { document.head.removeChild(meta); } catch (e) {} };
+      }, []);
+
+      useEffect(() => {
+        let live = true;
+        (async () => {
+          try {
+            // The 'anon read' RLS policy allows this fetch without a session.
+            const { data, error } = await supabase
+              .from("public_decks")
+              .select("snapshot, published_at, updated_at")
+              .eq("deck_id", deckId)
+              .maybeSingle();
+            if (!live) return;
+            if (error) { setError(error.message); setLoading(false); return; }
+            if (!data) {
+              setError("This workshop link isn't valid, or it's no longer published. Ask the person who shared it for an updated link.");
+              setLoading(false);
+              return;
+            }
+            setDeck(data.snapshot);
+          } catch (e) {
+            if (live) setError(e.message);
+          }
+          if (live) setLoading(false);
+        })();
+        return () => { live = false; };
+      }, [deckId]);
+
+      if (loading) {
+        return (
+          <div style={{ minHeight:"100vh", display:"flex", alignItems:"center", justifyContent:"center", background:"#FAF6EE" }}>
+            <Loader2 size={28} className="animate-spin" style={{ color:"#5B2D8A" }} />
+          </div>
+        );
+      }
+
+      if (error) {
+        return (
+          <div style={{ minHeight:"100vh", display:"flex", alignItems:"center", justifyContent:"center", padding:"24px", background:"#FAF6EE", fontFamily:"Manrope, sans-serif" }}>
+            <div style={{ maxWidth:"560px", width:"100%", background:"white", border:"1px solid #E6DFD0", borderRadius:"20px", padding:"36px 32px", textAlign:"center", boxShadow:"0 1px 3px rgba(0,0,0,0.04)" }}>
+              <div style={{ fontFamily:"Fraunces, Georgia, serif", fontSize:"28px", fontWeight:600, color:"#3E1E62", marginBottom:"6px" }}>
+                life<span style={{ color:"#1FAE7C" }}>house</span>
+              </div>
+              <div style={{ fontFamily:"Fraunces, Georgia, serif", fontStyle:"italic", color:"#6B6056", fontSize:"13px", marginBottom:"24px" }}>"Home, for good."</div>
+              <h2 style={{ fontFamily:"Fraunces, Georgia, serif", fontSize:"22px", fontWeight:500, color:"#1A1410", margin:"0 0 12px" }}>
+                Workshop unavailable
+              </h2>
+              <p style={{ color:"#3D332B", fontSize:"14px", lineHeight:1.55, margin:0 }}>{error}</p>
+            </div>
+          </div>
+        );
+      }
+
+      if (presenting) {
+        return <Presentation deck={deck} onClose={() => setPresenting(false)} />;
+      }
+
+      // Public read-only deck view
+      return (
+        <div className="min-h-screen flex flex-col" style={{ background: BRAND.cream, fontFamily: "Manrope, sans-serif", color: BRAND.ink }}>
+          <header className="border-b border-stone-200" style={{ background: "rgba(250,246,238,0.92)" }}>
+            <div className="max-w-7xl mx-auto px-6 lg:px-12 py-4 flex items-center justify-between gap-4">
+              <a href="https://lifehousereentry.com" target="_blank" rel="noopener noreferrer" className="cursor-pointer">
+                <Logo size="md" />
+              </a>
+              <div className="flex flex-wrap items-center gap-2">
+                <button onClick={() => setShowExport(true)} className="px-4 py-2 rounded-full text-sm font-semibold flex items-center gap-1.5 text-stone-700 bg-stone-100 hover:bg-stone-200 transition" title="Download as PDF or PowerPoint">
+                  <Download size={14} /> Download
+                </button>
+                <button onClick={() => setPresenting(true)} className="px-5 py-2 rounded-full text-sm font-semibold text-white flex items-center gap-2 transition shadow-sm" style={{ background: BRAND.purpleDeep }}>
+                  <Maximize2 size={14} /> Present
+                </button>
+              </div>
+            </div>
+          </header>
+
+          <div className="max-w-5xl mx-auto px-6 lg:px-12 py-10 w-full flex-1">
+            {/* Public badge */}
+            <div className="inline-flex items-center gap-1.5 text-[10px] font-bold uppercase tracking-widest px-2.5 py-1 rounded-full mb-3" style={{ background: `${BRAND.green}20`, color: BRAND.greenDeep }}>
+              <Eye size={10} /> Public preview
+            </div>
+            <h1 style={{ fontFamily: "Fraunces, Georgia, serif", letterSpacing: "-0.02em" }} className="text-4xl md:text-5xl font-medium text-stone-900 leading-tight mb-3">
+              {deck.title}
+            </h1>
+            {deck.tagline && (
+              <p style={{ fontFamily: "Fraunces, Georgia, serif", color: BRAND.purpleDeep }} className="text-xl italic mb-8">
+                {deck.tagline}
+              </p>
+            )}
+
+            {/* Slides as cards */}
+            <div className="space-y-4">
+              {deck.slides.map((s, i) => (
+                <div
+                  key={i}
+                  className="rounded-2xl overflow-hidden relative"
+                  data-theme-mode={getTheme(deck?.theme).bg.startsWith("#1") || getTheme(deck?.theme).bg.startsWith("#2") ? "dark" : "light"}
+                  style={{
+                    aspectRatio: "16/9",
+                    background: getTheme(deck?.theme).surface,
+                    border: `1px solid ${getTheme(deck?.theme).border}`,
+                    "--lh-ink": getTheme(deck?.theme).ink,
+                    "--lh-ink-soft": getTheme(deck?.theme).inkSoft,
+                    "--lh-paper": getTheme(deck?.theme).paper
+                  }}
+                >
+                  <div className="absolute inset-0 overflow-auto">
+                    <SlideRender slide={s} deck={deck} presenting />
+                  </div>
+                  <div className="absolute top-4 right-4 text-[10px] uppercase tracking-widest font-semibold opacity-50" style={{ fontFamily: "Manrope, sans-serif", color: getTheme(deck?.theme).inkSoft }}>
+                    {i + 1} / {deck.slides.length}
+                  </div>
+                </div>
+              ))}
+            </div>
+
+            {/* Footer attribution */}
+            <div className="mt-12 pt-6 border-t border-stone-200 text-xs text-stone-500 flex flex-wrap items-center justify-between gap-4" style={{ fontFamily: "Manrope, sans-serif" }}>
+              <span>Life House Reentry · 855-4-LIFEUP · julius@lifehousereentry.com</span>
+              <a href="https://lifehousereentry.com" target="_blank" rel="noopener noreferrer" className="hover:text-stone-900 transition flex items-center gap-1">
+                lifehousereentry.com <ExternalLink size={11} />
+              </a>
+            </div>
+          </div>
+
+          {showExport && deck && <ExportModal deck={deck} onClose={() => setShowExport(false)} />}
+          {/* Print region for PDF export */}
+          {deck && <PrintRegion deck={deck} />}
+        </div>
+      );
+    }
+
     function AuthGate({ children }) {
       const [session, setSession] = useState(null);
       const [profile, setProfile] = useState(null);
@@ -386,6 +575,14 @@
       };
 
       if (!SUPABASE_CONFIGURED) return <SetupNeededScreen />;
+
+      // ---- PUBLIC VIEWER short-circuit ----
+      // If URL has ?public=DECK_ID, skip auth and render the public viewer instead.
+      const urlParams = new URLSearchParams(window.location.search);
+      const publicId = urlParams.get("public");
+      if (publicId) {
+        return <PublicViewer deckId={publicId} />;
+      }
 
       if (recovery) return <LoginScreen onSignedIn={() => {}} />;
       if (!session) return <LoginScreen onSignedIn={() => {}} />;
@@ -4364,10 +4561,10 @@ const SLIDE_KIND_LABELS = {
   title: "Title", why: "Why this matters", objectives: "Objectives",
   concept: "Concept", deepdive: "Deep dive", case: "Case study",
   discussion: "Discussion", activity: "Activity", worksheet: "1-on-1 worksheet",
-  outcome: "Outcomes", resources: "Resources", image: "Image"
+  outcome: "Outcomes", resources: "Resources", image: "Image", video: "Video"
 };
 
-const SLIDE_ORDER = ["title", "why", "objectives", "concept", "deepdive", "case", "discussion", "activity", "image", "worksheet", "outcome", "resources"];
+const SLIDE_ORDER = ["title", "why", "objectives", "concept", "deepdive", "case", "discussion", "activity", "image", "video", "worksheet", "outcome", "resources"];
 
 function blankSlide(kind) {
   const m = {
@@ -4380,11 +4577,144 @@ function blankSlide(kind) {
     discussion: { kind, prompt: "Talk it through:", questions: ["Question 1", "Question 2", "Question 3"] },
     activity: { kind, title: "Activity (15 min)", instructions: "What we'll do together." },
     image: { kind, image: null, caption: "" },
+    video: { kind, videoUrl: "", caption: "" },
     worksheet: { kind, title: "Your 1-on-1 Hour", items: ["Task 1", "Task 2", "Task 3"] },
     outcome: { kind, title: "You walk out today with…", items: ["Outcome 1", "Outcome 2"] },
     resources: { kind, items: ["Resource name: phone / website"] }
   };
   return m[kind] || { kind };
+}
+
+// =====================================================================
+// THEMES — visual styles that change colors and feel deck-wide
+// =====================================================================
+const THEMES = {
+  default: {
+    id: "default",
+    name: "Life House",
+    description: "Cream paper, deep purple + green",
+    bg: "#FFFCF5",
+    surface: "#FFFFFF",
+    paper: "#FAF6EE",
+    ink: "#1A1410",
+    inkSoft: "#3D332B",
+    accent: "#5B2D8A",      // primary purple
+    accentDeep: "#3E1E62",
+    accent2: "#1FAE7C",     // green
+    accent3: "#D49A2D",     // amber for case studies
+    border: "#E6DFD0",
+    eyebrow: "#5B2D8A",
+    titleFont: "'Fraunces', Georgia, serif",
+    bodyFont: "'Manrope', system-ui, sans-serif"
+  },
+  midnight: {
+    id: "midnight",
+    name: "Midnight",
+    description: "Dark, focused — for evening cohorts",
+    bg: "#1A1226",
+    surface: "#241836",
+    paper: "#241836",
+    ink: "#F5EFE6",
+    inkSoft: "#C7BBD1",
+    accent: "#B996FF",
+    accentDeep: "#9B6DFF",
+    accent2: "#5BE3B5",
+    accent3: "#FFB85C",
+    border: "#3D2A55",
+    eyebrow: "#5BE3B5",
+    titleFont: "'Fraunces', Georgia, serif",
+    bodyFont: "'Manrope', system-ui, sans-serif"
+  },
+  garden: {
+    id: "garden",
+    name: "Garden",
+    description: "Green-forward — for wellness topics",
+    bg: "#F4FAF5",
+    surface: "#FFFFFF",
+    paper: "#EAF5EE",
+    ink: "#1B2E22",
+    inkSoft: "#3E5448",
+    accent: "#15825C",
+    accentDeep: "#0E5A3F",
+    accent2: "#5B2D8A",
+    accent3: "#D49A2D",
+    border: "#CFE4D7",
+    eyebrow: "#15825C",
+    titleFont: "'Fraunces', Georgia, serif",
+    bodyFont: "'Manrope', system-ui, sans-serif"
+  },
+  bold: {
+    id: "bold",
+    name: "Bold",
+    description: "High-contrast, modern — strong statement",
+    bg: "#FAF6EE",
+    surface: "#FFFFFF",
+    paper: "#1A1410",
+    ink: "#1A1410",
+    inkSoft: "#3D332B",
+    accent: "#1A1410",
+    accentDeep: "#000000",
+    accent2: "#1FAE7C",
+    accent3: "#D94A38",
+    border: "#1A1410",
+    eyebrow: "#1FAE7C",
+    titleFont: "'Fraunces', Georgia, serif",
+    bodyFont: "'Manrope', system-ui, sans-serif"
+  },
+  sunrise: {
+    id: "sunrise",
+    name: "Sunrise",
+    description: "Warm + uplifting — for hope-forward sessions",
+    bg: "#FFF8F0",
+    surface: "#FFFFFF",
+    paper: "#FFEFDB",
+    ink: "#3A2515",
+    inkSoft: "#6B4A30",
+    accent: "#D45A20",
+    accentDeep: "#A63E0E",
+    accent2: "#1FAE7C",
+    accent3: "#D49A2D",
+    border: "#F2D9B8",
+    eyebrow: "#D45A20",
+    titleFont: "'Fraunces', Georgia, serif",
+    bodyFont: "'Manrope', system-ui, sans-serif"
+  }
+};
+
+function getTheme(id) {
+  return THEMES[id] || THEMES.default;
+}
+
+// Detect & normalize video URL into an embeddable form.
+// Returns: { kind: "youtube"|"vimeo"|"file"|"unknown", embedUrl, posterUrl?, originalUrl }
+function parseVideoUrl(raw) {
+  if (!raw || typeof raw !== "string") return { kind: "unknown", embedUrl: "", originalUrl: "" };
+  const url = raw.trim();
+  // YouTube
+  let m = url.match(/(?:youtube\.com\/watch\?v=|youtu\.be\/|youtube\.com\/embed\/|youtube\.com\/shorts\/)([a-zA-Z0-9_-]{11})/);
+  if (m) {
+    const id = m[1];
+    return {
+      kind: "youtube",
+      embedUrl: `https://www.youtube.com/embed/${id}?rel=0&modestbranding=1`,
+      posterUrl: `https://img.youtube.com/vi/${id}/maxresdefault.jpg`,
+      originalUrl: url
+    };
+  }
+  // Vimeo
+  m = url.match(/vimeo\.com\/(?:video\/)?(\d+)/);
+  if (m) {
+    return {
+      kind: "vimeo",
+      embedUrl: `https://player.vimeo.com/video/${m[1]}?title=0&byline=0&portrait=0`,
+      originalUrl: url
+    };
+  }
+  // Direct video file (mp4 / webm / mov / m4v) or a Spaces URL
+  if (/\.(mp4|webm|mov|m4v|ogv)(\?|$)/i.test(url) || url.includes("digitaloceanspaces.com")) {
+    return { kind: "file", embedUrl: url, originalUrl: url };
+  }
+  return { kind: "unknown", embedUrl: url, originalUrl: url };
 }
 
 // Collect all image attributions used in a deck (for resources slide auto-credits)
@@ -4590,20 +4920,46 @@ function CatalogView({ allDecks, customDecks, onOpen, search, setSearch, onNewCu
 // SLIDE RENDERERS (presentation + preview)
 // =====================================================================
 
-function SlideRender({ slide, deck, presenting }) {
+function SlideRender({ slide, deck, presenting, bulletReveal = null }) {
   if (!slide) return null;
   const k = slide.kind;
-  const baseText = presenting ? "text-stone-900" : "text-stone-900";
+  // bulletReveal === null means "show all" (default).
+  // Otherwise it's the count of bullets currently revealed (0..N).
+  const isVisible = (i) => bulletReveal === null || i < bulletReveal;
+
+  // Resolve theme. Falls back to default if deck has no theme set.
+  const theme = getTheme(deck?.theme);
+  // Theme color map for renderer use (keeps existing BRAND.* names valid via mapping below)
+  const T = {
+    purple: theme.accent,
+    purpleDeep: theme.accentDeep,
+    green: theme.accent2,
+    greenDeep: theme.accent2,
+    amber: theme.accent3,
+    cream: theme.bg,
+    paper: theme.paper,
+    ink: theme.ink,
+    inkSoft: theme.inkSoft,
+    border: theme.border,
+    eyebrow: theme.eyebrow,
+    surface: theme.surface,
+    titleFont: theme.titleFont,
+    bodyFont: theme.bodyFont
+  };
+  // Style helpers driven by theme, used in lieu of "text-stone-900" so dark themes work
+  const ssTitle = { color: T.ink, fontFamily: T.titleFont };
+  const ssBody = { color: T.inkSoft, fontFamily: T.bodyFont };
+  const ssEyebrow = { color: T.eyebrow };
 
   // Helper: render a side-image panel for any slide that has slide.image.
   // Returns null if no image, otherwise an absolutely-positioned panel in upper right.
-  const sideImage = slide.image && k !== "image" && k !== "title" ? (
+  const sideImage = slide.image && k !== "image" && k !== "title" && k !== "video" ? (
     <div className="absolute top-6 right-6 w-32 sm:w-44 md:w-56 z-10 pointer-events-none">
       <img
         src={slide.image.thumbUrl || slide.image.previewUrl}
         alt={slide.image.alt || ""}
-        className="w-full h-auto object-cover rounded-xl shadow-lg ring-1 ring-stone-200"
-        style={{ aspectRatio: "4/3" }}
+        className="w-full h-auto object-cover rounded-xl shadow-lg"
+        style={{ aspectRatio: "4/3", outline: `1px solid ${T.border}` }}
         loading="lazy"
       />
     </div>
@@ -4619,19 +4975,19 @@ function SlideRender({ slide, deck, presenting }) {
           </div>
         )}
         <div className="relative">
-          <div className="text-xs uppercase tracking-[0.3em] mb-6" style={{ color: BRAND.purple, fontWeight: 600 }}>
+          <div className="text-xs uppercase tracking-[0.3em] mb-6" style={{ color: T.purple, fontWeight: 600 }}>
             Life House Reentry · Workshop
           </div>
           <h1 style={{ fontFamily: "Fraunces, Georgia, serif", lineHeight: 0.95, letterSpacing: "-0.03em" }} className={`${presenting ? "text-7xl md:text-8xl" : "text-5xl"} font-medium text-stone-900 mb-6`}>
             {slide.title}
           </h1>
           {slide.tagline && (
-            <p style={{ fontFamily: "Fraunces, Georgia, serif", color: BRAND.purpleDeep }} className={`${presenting ? "text-3xl" : "text-xl"} italic max-w-3xl leading-snug`}>
+            <p style={{ fontFamily: "Fraunces, Georgia, serif", color: T.purpleDeep }} className={`${presenting ? "text-3xl" : "text-xl"} italic max-w-3xl leading-snug`}>
               {slide.tagline}
             </p>
           )}
           <div className="mt-12 flex items-center gap-4">
-            <div className="h-px flex-1" style={{ background: BRAND.border }} />
+            <div className="h-px flex-1" style={{ background: T.border }} />
             <Logo size="sm" />
           </div>
         </div>
@@ -4643,7 +4999,7 @@ function SlideRender({ slide, deck, presenting }) {
     return (
       <div className="flex flex-col justify-center h-full px-8 relative">
         {sideImage}
-        <div className="text-xs uppercase tracking-[0.3em] mb-6 font-semibold" style={{ color: BRAND.green }}>Why this matters</div>
+        <div className="text-xs uppercase tracking-[0.3em] mb-6 font-semibold" style={{ color: T.green }}>Why this matters</div>
         <div className="space-y-8 max-w-4xl">
           <p style={{ fontFamily: "Fraunces, Georgia, serif" }} className={`${presenting ? "text-5xl" : "text-3xl"} font-medium text-stone-900 leading-tight`}>
             "{slide.hook}"
@@ -4660,7 +5016,7 @@ function SlideRender({ slide, deck, presenting }) {
     return (
       <div className="flex flex-col justify-center h-full px-8 relative">
         {sideImage}
-        <div className="text-xs uppercase tracking-[0.3em] mb-6 font-semibold" style={{ color: BRAND.purple }}>By the end of this hour</div>
+        <div className="text-xs uppercase tracking-[0.3em] mb-6 font-semibold" style={{ color: T.purple }}>By the end of this hour</div>
         <h2 style={{ fontFamily: "Fraunces, Georgia, serif" }} className={`${presenting ? "text-5xl" : "text-3xl"} font-medium text-stone-900 mb-10 leading-tight`}>
           You will…
         </h2>
@@ -4669,13 +5025,13 @@ function SlideRender({ slide, deck, presenting }) {
             const lvl = itemLevel(it);
             const txt = itemText(it);
             return (
-              <li key={i} className="flex gap-5 items-start" style={{ marginLeft: lvl * 32 + "px" }}>
+              <li key={i} className="flex gap-5 items-start" style={{ marginLeft: lvl * 32 + "px" , opacity: isVisible(i) ? 1 : 0, transform: isVisible(i) ? "none" : "translateY(8px)", transition: "opacity 0.4s ease, transform 0.4s ease" }}>
                 {lvl === 0 ? (
-                  <span style={{ background: BRAND.green, fontFamily: "Fraunces, Georgia, serif" }} className={`shrink-0 ${presenting ? "w-12 h-12 text-2xl" : "w-9 h-9 text-base"} rounded-full flex items-center justify-center text-white font-medium`}>
+                  <span style={{ background: T.green, fontFamily: "Fraunces, Georgia, serif" }} className={`shrink-0 ${presenting ? "w-12 h-12 text-2xl" : "w-9 h-9 text-base"} rounded-full flex items-center justify-center text-white font-medium`}>
                     {i + 1}
                   </span>
                 ) : (
-                  <span className={`shrink-0 mt-3 ${presenting ? "w-3 h-3" : "w-2 h-2"} rounded-full`} style={{ background: BRAND.green, opacity: 1 - lvl * 0.2 }} />
+                  <span className={`shrink-0 mt-3 ${presenting ? "w-3 h-3" : "w-2 h-2"} rounded-full`} style={{ background: T.green, opacity: 1 - lvl * 0.2 }} />
                 )}
                 <span style={{ fontFamily: "Manrope, sans-serif" }} className={`${presenting ? (lvl > 0 ? "text-xl" : "text-2xl") : (lvl > 0 ? "text-base" : "text-lg")} ${lvl > 0 ? "text-stone-600" : "text-stone-800"} leading-snug pt-1`}>
                   {renderInline(txt)}
@@ -4692,7 +5048,7 @@ function SlideRender({ slide, deck, presenting }) {
     return (
       <div className={`flex h-full ${slide.image ? "" : "flex-col justify-center"} px-8 gap-8`}>
         <div className={`flex flex-col justify-center ${slide.image ? "flex-1 min-w-0" : "w-full"}`}>
-          <div className="text-xs uppercase tracking-[0.3em] mb-6 font-semibold" style={{ color: BRAND.purple }}>Concept</div>
+          <div className="text-xs uppercase tracking-[0.3em] mb-6 font-semibold" style={{ color: T.purple }}>Concept</div>
           {slide.title && (
             <h2 style={{ fontFamily: "Fraunces, Georgia, serif", letterSpacing: "-0.02em" }} className={`${presenting ? (slide.image ? "text-5xl" : "text-6xl") : (slide.image ? "text-3xl" : "text-4xl")} font-medium text-stone-900 mb-8 leading-tight max-w-4xl`}>
               {slide.title}
@@ -4715,7 +5071,7 @@ function SlideRender({ slide, deck, presenting }) {
     return (
       <div className="flex flex-col justify-center h-full px-8 py-8 relative">
         {sideImage}
-        <div className="text-xs uppercase tracking-[0.3em] mb-6 font-semibold" style={{ color: BRAND.purple }}>Deep dive</div>
+        <div className="text-xs uppercase tracking-[0.3em] mb-6 font-semibold" style={{ color: T.purple }}>Deep dive</div>
         {slide.title && (
           <h2 style={{ fontFamily: "Fraunces, Georgia, serif" }} className={`${presenting ? "text-5xl" : "text-3xl"} font-medium text-stone-900 mb-8 leading-tight`}>
             {slide.title}
@@ -4726,8 +5082,8 @@ function SlideRender({ slide, deck, presenting }) {
             const lvl = itemLevel(it);
             const txt = itemText(it);
             return (
-              <li key={i} className="flex gap-3 items-start" style={{ marginLeft: lvl * 28 + "px" }}>
-                <span className={`shrink-0 mt-2 ${lvl === 0 ? "w-1.5 h-1.5 rounded-full" : "w-2 h-px mt-3"}`} style={{ background: BRAND.green, opacity: 1 - lvl * 0.25 }} />
+              <li key={i} className="flex gap-3 items-start" style={{ marginLeft: lvl * 28 + "px" , opacity: isVisible(i) ? 1 : 0, transform: isVisible(i) ? "none" : "translateY(8px)", transition: "opacity 0.4s ease, transform 0.4s ease" }}>
+                <span className={`shrink-0 mt-2 ${lvl === 0 ? "w-1.5 h-1.5 rounded-full" : "w-2 h-px mt-3"}`} style={{ background: T.green, opacity: 1 - lvl * 0.25 }} />
                 <span style={{ fontFamily: "Manrope, sans-serif" }} className={`${presenting ? (lvl > 0 ? "text-lg" : "text-xl") : (lvl > 0 ? "text-sm" : "text-base")} ${lvl > 0 ? "text-stone-600" : "text-stone-800"} leading-snug`}>
                   {renderInline(txt)}
                 </span>
@@ -4743,9 +5099,9 @@ function SlideRender({ slide, deck, presenting }) {
     return (
       <div className={`flex h-full px-8 py-8 gap-8 ${slide.image ? "" : "flex-col justify-center"}`}>
         <div className={`flex flex-col justify-center ${slide.image ? "flex-1 min-w-0" : "w-full"}`}>
-          <div className="text-xs uppercase tracking-[0.3em] mb-6 font-semibold" style={{ color: BRAND.amber }}>Case study</div>
-          <div className="bg-white rounded-3xl p-10 max-w-4xl border-l-4" style={{ borderColor: BRAND.amber, background: BRAND.paper }}>
-            <div style={{ fontFamily: "Fraunces, Georgia, serif", color: BRAND.purpleDeep }} className={`${presenting ? "text-3xl" : "text-2xl"} italic mb-4`}>
+          <div className="text-xs uppercase tracking-[0.3em] mb-6 font-semibold" style={{ color: T.amber }}>Case study</div>
+          <div className="bg-white rounded-3xl p-10 max-w-4xl border-l-4" style={{ borderColor: T.amber, background: T.paper }}>
+            <div style={{ fontFamily: "Fraunces, Georgia, serif", color: T.purpleDeep }} className={`${presenting ? "text-3xl" : "text-2xl"} italic mb-4`}>
               {slide.name}
             </div>
             <p style={{ fontFamily: "Manrope, sans-serif" }} className={`${presenting ? "text-xl" : "text-base"} text-stone-700 leading-relaxed`}>
@@ -4766,7 +5122,7 @@ function SlideRender({ slide, deck, presenting }) {
     return (
       <div className="flex flex-col justify-center h-full px-8 relative">
         {sideImage}
-        <div className="text-xs uppercase tracking-[0.3em] mb-6 font-semibold" style={{ color: BRAND.green }}>Discussion</div>
+        <div className="text-xs uppercase tracking-[0.3em] mb-6 font-semibold" style={{ color: T.green }}>Discussion</div>
         <h2 style={{ fontFamily: "Fraunces, Georgia, serif" }} className={`${presenting ? "text-5xl" : "text-3xl"} font-medium text-stone-900 mb-10 italic`}>
           {slide.prompt}
         </h2>
@@ -4775,13 +5131,13 @@ function SlideRender({ slide, deck, presenting }) {
             const lvl = itemLevel(q);
             const txt = itemText(q);
             return (
-              <li key={i} className="flex gap-5 items-start" style={{ marginLeft: lvl * 32 + "px" }}>
+              <li key={i} className="flex gap-5 items-start" style={{ marginLeft: lvl * 32 + "px" , opacity: isVisible(i) ? 1 : 0, transform: isVisible(i) ? "none" : "translateY(8px)", transition: "opacity 0.4s ease, transform 0.4s ease" }}>
                 {lvl === 0 ? (
-                  <span style={{ fontFamily: "Fraunces, Georgia, serif", color: BRAND.green }} className={`${presenting ? "text-4xl" : "text-2xl"} font-medium leading-none`}>
+                  <span style={{ fontFamily: "Fraunces, Georgia, serif", color: T.green }} className={`${presenting ? "text-4xl" : "text-2xl"} font-medium leading-none`}>
                     Q{i + 1}.
                   </span>
                 ) : (
-                  <span className="shrink-0 mt-3 w-2 h-px" style={{ background: BRAND.green, opacity: 1 - lvl * 0.25 }} />
+                  <span className="shrink-0 mt-3 w-2 h-px" style={{ background: T.green, opacity: 1 - lvl * 0.25 }} />
                 )}
                 <span style={{ fontFamily: "Fraunces, Georgia, serif" }} className={`${presenting ? (lvl > 0 ? "text-2xl" : "text-3xl") : (lvl > 0 ? "text-lg" : "text-xl")} ${lvl > 0 ? "text-stone-600" : "text-stone-800"} leading-snug italic`}>
                   {txt}
@@ -4798,11 +5154,11 @@ function SlideRender({ slide, deck, presenting }) {
     return (
       <div className={`flex h-full px-8 gap-8 ${slide.image ? "" : "flex-col justify-center"}`}>
         <div className={`flex flex-col justify-center ${slide.image ? "flex-1 min-w-0" : "w-full"}`}>
-          <div className="text-xs uppercase tracking-[0.3em] mb-6 font-semibold" style={{ color: BRAND.purple }}>Activity — together</div>
+          <div className="text-xs uppercase tracking-[0.3em] mb-6 font-semibold" style={{ color: T.purple }}>Activity — together</div>
           <h2 style={{ fontFamily: "Fraunces, Georgia, serif", letterSpacing: "-0.02em" }} className={`${presenting ? "text-5xl" : "text-3xl"} font-medium text-stone-900 mb-8 leading-tight`}>
             {slide.title}
           </h2>
-          <div className="rounded-3xl p-10 max-w-4xl" style={{ background: `${BRAND.purple}10`, border: `1px solid ${BRAND.purple}25` }}>
+          <div className="rounded-3xl p-10 max-w-4xl" style={{ background: `${T.purple}10`, border: `1px solid ${T.purple}25` }}>
             <p style={{ fontFamily: "Manrope, sans-serif" }} className={`${presenting ? (slide.image ? "text-xl" : "text-2xl") : "text-lg"} text-stone-800 leading-relaxed`}>
               {slide.instructions}
             </p>
@@ -4840,11 +5196,46 @@ function SlideRender({ slide, deck, presenting }) {
     );
   }
 
+  if (k === "video") {
+    const v = parseVideoUrl(slide.videoUrl || "");
+    if (!slide.videoUrl || v.kind === "unknown") {
+      return (
+        <div className="flex flex-col items-center justify-center h-full px-8 text-stone-400">
+          <Video size={48} className="mb-4 opacity-40" />
+          <p className="text-sm" style={{ fontFamily: "Manrope, sans-serif" }}>{slide.videoUrl ? "Couldn't recognize that video URL." : "No video yet — edit this slide to add one."}</p>
+        </div>
+      );
+    }
+    return (
+      <div className="flex flex-col items-center justify-center h-full px-6 py-5 gap-3 bg-stone-900">
+        <div className="flex-1 w-full flex items-center justify-center min-h-0">
+          {v.kind === "file" ? (
+            <video src={v.embedUrl} controls playsInline className="max-w-full max-h-full rounded-xl shadow-2xl" style={{ aspectRatio: "16/9" }} />
+          ) : (
+            <iframe
+              src={v.embedUrl}
+              title={slide.caption || "Workshop video"}
+              allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture"
+              allowFullScreen
+              className="rounded-xl shadow-2xl"
+              style={{ width: "100%", height: "100%", aspectRatio: "16/9", border: 0, maxHeight: "100%" }}
+            />
+          )}
+        </div>
+        {slide.caption && (
+          <div style={{ fontFamily: "Fraunces, Georgia, serif" }} className={`${presenting ? "text-xl" : "text-base"} text-white text-center italic max-w-3xl`}>
+            {slide.caption}
+          </div>
+        )}
+      </div>
+    );
+  }
+
   if (k === "worksheet") {
     return (
       <div className="flex flex-col justify-center h-full px-8 relative">
         {sideImage}
-        <div className="text-xs uppercase tracking-[0.3em] mb-6 font-semibold" style={{ color: BRAND.green }}>1-on-1 hour</div>
+        <div className="text-xs uppercase tracking-[0.3em] mb-6 font-semibold" style={{ color: T.green }}>1-on-1 hour</div>
         <h2 style={{ fontFamily: "Fraunces, Georgia, serif" }} className={`${presenting ? "text-5xl" : "text-3xl"} font-medium text-stone-900 mb-10 leading-tight`}>
           {slide.title}
         </h2>
@@ -4853,13 +5244,13 @@ function SlideRender({ slide, deck, presenting }) {
             const lvl = itemLevel(it);
             const txt = itemText(it);
             return (
-              <li key={i} className="flex gap-5 items-start" style={{ marginLeft: lvl * 28 + "px" }}>
+              <li key={i} className="flex gap-5 items-start" style={{ marginLeft: lvl * 28 + "px" , opacity: isVisible(i) ? 1 : 0, transform: isVisible(i) ? "none" : "translateY(8px)", transition: "opacity 0.4s ease, transform 0.4s ease" }}>
                 {lvl === 0 ? (
-                  <span style={{ background: BRAND.green, color: "white", fontFamily: "Manrope, sans-serif" }} className={`shrink-0 ${presenting ? "w-10 h-10 text-lg" : "w-8 h-8 text-sm"} rounded-md flex items-center justify-center font-semibold`}>
+                  <span style={{ background: T.green, color: "white", fontFamily: "Manrope, sans-serif" }} className={`shrink-0 ${presenting ? "w-10 h-10 text-lg" : "w-8 h-8 text-sm"} rounded-md flex items-center justify-center font-semibold`}>
                     {String(i + 1).padStart(2, "0")}
                   </span>
                 ) : (
-                  <span className="shrink-0 mt-3 w-2 h-px" style={{ background: BRAND.green, opacity: 1 - lvl * 0.25 }} />
+                  <span className="shrink-0 mt-3 w-2 h-px" style={{ background: T.green, opacity: 1 - lvl * 0.25 }} />
                 )}
                 <span style={{ fontFamily: "Manrope, sans-serif" }} className={`${presenting ? (lvl > 0 ? "text-lg" : "text-xl") : (lvl > 0 ? "text-sm" : "text-base")} ${lvl > 0 ? "text-stone-600" : "text-stone-800"} leading-snug pt-1 whitespace-pre-wrap`}>
                   {renderInline(txt)}
@@ -4876,7 +5267,7 @@ function SlideRender({ slide, deck, presenting }) {
     return (
       <div className="flex flex-col justify-center h-full px-8 relative">
         {sideImage}
-        <div className="text-xs uppercase tracking-[0.3em] mb-6 font-semibold" style={{ color: BRAND.green }}>The outcome</div>
+        <div className="text-xs uppercase tracking-[0.3em] mb-6 font-semibold" style={{ color: T.green }}>The outcome</div>
         <h2 style={{ fontFamily: "Fraunces, Georgia, serif" }} className={`${presenting ? "text-5xl" : "text-3xl"} font-medium text-stone-900 mb-10 leading-tight italic`}>
           {slide.title}
         </h2>
@@ -4885,11 +5276,11 @@ function SlideRender({ slide, deck, presenting }) {
             const lvl = itemLevel(it);
             const txt = itemText(it);
             return (
-              <li key={i} className="flex gap-4 items-start" style={{ marginLeft: lvl * 28 + "px" }}>
+              <li key={i} className="flex gap-4 items-start" style={{ marginLeft: lvl * 28 + "px" , opacity: isVisible(i) ? 1 : 0, transform: isVisible(i) ? "none" : "translateY(8px)", transition: "opacity 0.4s ease, transform 0.4s ease" }}>
                 {lvl === 0 ? (
-                  <Check size={presenting ? 28 : 20} className="shrink-0 mt-1" style={{ color: BRAND.green }} />
+                  <Check size={presenting ? 28 : 20} className="shrink-0 mt-1" style={{ color: T.green }} />
                 ) : (
-                  <span className="shrink-0 mt-3 w-2 h-px" style={{ background: BRAND.green, opacity: 1 - lvl * 0.25 }} />
+                  <span className="shrink-0 mt-3 w-2 h-px" style={{ background: T.green, opacity: 1 - lvl * 0.25 }} />
                 )}
                 <span style={{ fontFamily: "Manrope, sans-serif" }} className={`${presenting ? (lvl > 0 ? "text-xl" : "text-2xl") : (lvl > 0 ? "text-base" : "text-lg")} ${lvl > 0 ? "text-stone-600" : "text-stone-800"} leading-snug`}>
                   {renderInline(txt)}
@@ -4907,7 +5298,7 @@ function SlideRender({ slide, deck, presenting }) {
     return (
       <div className="flex flex-col justify-center h-full px-8 py-6 overflow-auto relative">
         {sideImage}
-        <div className="text-xs uppercase tracking-[0.3em] mb-6 font-semibold" style={{ color: BRAND.purple }}>Resources</div>
+        <div className="text-xs uppercase tracking-[0.3em] mb-6 font-semibold" style={{ color: T.purple }}>Resources</div>
         <h2 style={{ fontFamily: "Fraunces, Georgia, serif" }} className={`${presenting ? "text-5xl" : "text-3xl"} font-medium text-stone-900 mb-8 leading-tight`}>
           Take these with you
         </h2>
@@ -4916,8 +5307,8 @@ function SlideRender({ slide, deck, presenting }) {
             const lvl = itemLevel(it);
             const txt = itemText(it);
             return (
-              <li key={i} className="flex gap-4 items-start p-4 rounded-xl bg-white border border-stone-200" style={{ marginLeft: lvl * 28 + "px" }}>
-                <Phone size={presenting ? 22 : 16} className="shrink-0 mt-1" style={{ color: BRAND.purple, opacity: 1 - lvl * 0.3 }} />
+              <li key={i} className="flex gap-4 items-start p-4 rounded-xl bg-white border border-stone-200" style={{ marginLeft: lvl * 28 + "px" , opacity: isVisible(i) ? 1 : 0, transform: isVisible(i) ? "none" : "translateY(8px)", transition: "opacity 0.4s ease, transform 0.4s ease" }}>
+                <Phone size={presenting ? 22 : 16} className="shrink-0 mt-1" style={{ color: T.purple, opacity: 1 - lvl * 0.3 }} />
                 <span style={{ fontFamily: "Manrope, sans-serif" }} className={`${presenting ? "text-xl" : "text-base"} ${lvl > 0 ? "text-stone-600" : "text-stone-800"} leading-snug`}>
                   {txt}
                 </span>
@@ -4928,7 +5319,7 @@ function SlideRender({ slide, deck, presenting }) {
 
         {credits.length > 0 && (
           <div className="mt-8 pt-6 border-t border-stone-200 max-w-3xl">
-            <div className="text-[10px] uppercase tracking-[0.25em] font-semibold mb-3" style={{ color: BRAND.inkSoft, fontFamily: "Manrope, sans-serif" }}>
+            <div className="text-[10px] uppercase tracking-[0.25em] font-semibold mb-3" style={{ color: T.inkSoft, fontFamily: "Manrope, sans-serif" }}>
               Image credits
             </div>
             <div className={`${presenting ? "text-sm" : "text-xs"} text-stone-500 leading-relaxed`} style={{ fontFamily: "Manrope, sans-serif" }}>
@@ -5175,6 +5566,46 @@ function SlideEditor({ slide, onChange }) {
         </>
       )}
       {(k === "image") && renderImageEditor()}
+      {(k === "video") && (
+        <>
+          <div>
+            <label className={labelCls}>Video URL</label>
+            <input
+              value={slide.videoUrl || ""}
+              onChange={e => set("videoUrl", e.target.value)}
+              className={inputCls}
+              placeholder="Paste a YouTube, Vimeo, or direct video link"
+            />
+            <div className="text-xs text-stone-500 mt-1.5 leading-relaxed" style={{ fontFamily: "Manrope, sans-serif" }}>
+              Works with: YouTube (e.g. <code className="text-stone-700">youtu.be/dQw4w9WgXcQ</code>), Vimeo,
+              and direct <code className="text-stone-700">.mp4</code> / <code className="text-stone-700">.webm</code> URLs (including your DigitalOcean recordings).
+            </div>
+            {slide.videoUrl && (() => {
+              const v = parseVideoUrl(slide.videoUrl);
+              return (
+                <div className={`mt-2 inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs font-semibold ${v.kind === "unknown" ? "bg-red-50 text-red-700" : "bg-emerald-50 text-emerald-700"}`}>
+                  {v.kind === "unknown" ? <><AlertCircle size={12} /> URL not recognized</> : <><Check size={12} /> Recognized as {v.kind}</>}
+                </div>
+              );
+            })()}
+          </div>
+          <div>
+            <label className={labelCls}>Caption (optional)</label>
+            <input value={slide.caption || ""} onChange={e => set("caption", e.target.value)} className={inputCls} placeholder="Caption shown under the video" />
+          </div>
+          {slide.videoUrl && parseVideoUrl(slide.videoUrl).kind !== "unknown" && (
+            <div className="rounded-xl overflow-hidden border border-stone-200" style={{ aspectRatio: "16/9" }}>
+              {(() => {
+                const v = parseVideoUrl(slide.videoUrl);
+                if (v.kind === "file") {
+                  return <video src={v.embedUrl} controls className="w-full h-full" />;
+                }
+                return <iframe src={v.embedUrl} className="w-full h-full" allow="autoplay; encrypted-media; picture-in-picture" allowFullScreen style={{ border: 0 }} />;
+              })()}
+            </div>
+          )}
+        </>
+      )}
       {(k === "worksheet") && (
         <>
           <div><label className={labelCls}>Title</label><input value={slide.title || ""} onChange={e => set("title", e.target.value)} className={inputCls} /></div>
@@ -5223,17 +5654,52 @@ function SlideEditor({ slide, onChange }) {
 function Presentation({ deck, onClose }) {
   const [idx, setIdx] = useState(0);
   const [showNotes, setShowNotes] = useState(false);
+  const [bulletStep, setBulletStep] = useState(0); // current bullet "step" within a slide
+  const [animKey, setAnimKey] = useState(0); // bumps to retrigger CSS animation on slide change
+
+  // Per-deck settings with defaults
+  const transitionStyle = deck?.transition || "smooth"; // "smooth" | "lively"
+  const bulletAnim = deck?.bulletAnim || "all";          // "all" | "click"
+
+  // Count of "stepped" bullets on current slide (only used when bulletAnim==="click")
+  const currentSlide = deck.slides[idx];
+  const bulletCount = useMemo(() => {
+    if (!currentSlide) return 0;
+    const arr = currentSlide.items || currentSlide.questions || [];
+    return arr.length;
+  }, [currentSlide]);
+
+  // Reset bullet step when slide changes
+  useEffect(() => {
+    setBulletStep(0);
+    setAnimKey(k => k + 1);
+  }, [idx]);
+
+  const advance = () => {
+    if (bulletAnim === "click" && bulletStep < bulletCount) {
+      setBulletStep(s => s + 1);
+      return;
+    }
+    setIdx(i => Math.min(deck.slides.length - 1, i + 1));
+  };
+  const retreat = () => {
+    if (bulletAnim === "click" && bulletStep > 0) {
+      setBulletStep(s => s - 1);
+      return;
+    }
+    setIdx(i => Math.max(0, i - 1));
+  };
 
   useEffect(() => {
     const onKey = (e) => {
-      if (e.key === "ArrowRight" || e.key === " " || e.key === "PageDown") setIdx(i => Math.min(deck.slides.length - 1, i + 1));
-      else if (e.key === "ArrowLeft" || e.key === "PageUp") setIdx(i => Math.max(0, i - 1));
+      if (e.key === "ArrowRight" || e.key === " " || e.key === "PageDown") advance();
+      else if (e.key === "ArrowLeft" || e.key === "PageUp") retreat();
       else if (e.key === "Escape") onClose();
       else if (e.key === "n" || e.key === "N") setShowNotes(v => !v);
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [deck.slides.length, onClose]);
+  }, [deck.slides.length, onClose, bulletStep, bulletCount, bulletAnim]);
 
   const slide = deck.slides[idx];
   const total = deck.slides.length;
@@ -5289,11 +5755,23 @@ function Presentation({ deck, onClose }) {
         </div>
 
         <div className="flex-1 flex items-center justify-center p-8 lg:p-16 overflow-auto">
-          <div className="w-full max-w-6xl h-full max-h-[85vh] rounded-3xl shadow-2xl bg-white border border-stone-200 overflow-hidden relative" style={{ aspectRatio: "16/9" }}>
+          <div
+            key={animKey}
+            className={`w-full max-w-6xl h-full max-h-[85vh] rounded-3xl shadow-2xl overflow-hidden relative ${transitionStyle === "lively" ? "lh-anim-lively" : "lh-anim-smooth"}`}
+            data-theme-mode={getTheme(deck?.theme).bg.startsWith("#1") || getTheme(deck?.theme).bg.startsWith("#2") ? "dark" : "light"}
+            style={{
+              aspectRatio: "16/9",
+              background: getTheme(deck?.theme).surface,
+              border: `1px solid ${getTheme(deck?.theme).border}`,
+              "--lh-ink": getTheme(deck?.theme).ink,
+              "--lh-ink-soft": getTheme(deck?.theme).inkSoft,
+              "--lh-paper": getTheme(deck?.theme).paper
+            }}
+          >
             <div className="absolute inset-0 overflow-auto">
-              <SlideRender slide={slide} deck={deck} presenting />
+              <SlideRender slide={slide} deck={deck} presenting bulletReveal={bulletAnim === "click" ? bulletStep : null} />
             </div>
-            <div className="absolute top-6 right-8 text-xs uppercase tracking-widest text-stone-300 font-semibold" style={{ fontFamily: "Manrope, sans-serif" }}>
+            <div className="absolute top-6 right-8 text-xs uppercase tracking-widest font-semibold opacity-50" style={{ fontFamily: "Manrope, sans-serif", color: getTheme(deck?.theme).inkSoft }}>
               {idx + 1} / {total}
             </div>
           </div>
@@ -5471,6 +5949,7 @@ function DeckView({ deck, deckId, onBack, onPresent, onSave, onReset, isCustom, 
   const [activeIdx, setActiveIdx] = useState(0);
   const [editing, setEditing] = useState(false);
   const [showAddMenu, setShowAddMenu] = useState(false);
+  const [isPublished, setIsPublished] = useState(false);
 
   const cat = CATEGORIES.find(c => c.id === (deck.cat || deck.category)) || CATEGORIES[0];
   const slide = deck.slides[activeIdx];
@@ -5561,7 +6040,9 @@ function DeckView({ deck, deckId, onBack, onPresent, onSave, onReset, isCustom, 
             <button onClick={onShowExport} className="px-4 py-2 rounded-full text-sm font-semibold flex items-center gap-1.5 text-stone-700 bg-stone-100 hover:bg-stone-200 transition" style={{ fontFamily: "Manrope, sans-serif" }} title="Download as PDF or PowerPoint">
               <Download size={14} /> Download
             </button>
-            <ShareDeckButton deckId={deckId} />
+            <DeckSettingsDropdown deck={deck} onChange={onSave} />
+            <PublishToggle deck={deck} deckId={deckId} onPublishChange={setIsPublished} />
+            <ShareDeckButton deckId={deckId} isPublished={isPublished} />
             {!isCustom && (
               <button onClick={onReset} className="px-4 py-2 rounded-full text-sm font-semibold flex items-center gap-1.5 text-stone-500 hover:text-stone-900 transition" style={{ fontFamily: "Manrope, sans-serif" }} title="Reset to original">
                 <RotateCcw size={14} /> Reset
@@ -5614,7 +6095,7 @@ function DeckView({ deck, deckId, onBack, onPresent, onSave, onReset, isCustom, 
                     <span className="text-[10px] font-semibold uppercase tracking-wider" style={{ color: cat.accent }}>{SLIDE_KIND_LABELS[s.kind]}</span>
                   </div>
                   <div style={{ fontFamily: "Fraunces, Georgia, serif" }} className="text-sm text-stone-800 leading-snug line-clamp-2">
-                    {s.title || s.hook || s.name || s.prompt || (s.items && itemText(s.items[0])) || s.body || "(empty)"}
+                    {s.title || s.hook || s.name || s.prompt || (s.items && itemText(s.items[0])) || s.body || s.caption || (s.kind === "video" && s.videoUrl ? "🎬 " + (parseVideoUrl(s.videoUrl).kind === "youtube" ? "YouTube video" : parseVideoUrl(s.videoUrl).kind === "vimeo" ? "Vimeo video" : "Video") : "") || (s.kind === "image" && s.image ? "🖼 Image: " + (s.image.alt || s.image.photographer || "Photo") : "") || "(empty)"}
                   </div>
                 </button>
               </div>
@@ -5669,7 +6150,18 @@ function DeckView({ deck, deckId, onBack, onPresent, onSave, onReset, isCustom, 
               )}
             </div>
 
-            <div className="rounded-2xl bg-white border border-stone-200 mb-6 overflow-hidden" style={{ aspectRatio: "16/10" }}>
+            <div
+              className="rounded-2xl mb-6 overflow-hidden"
+              data-theme-mode={getTheme(deck?.theme).bg.startsWith("#1") || getTheme(deck?.theme).bg.startsWith("#2") ? "dark" : "light"}
+              style={{
+                aspectRatio: "16/10",
+                background: getTheme(deck?.theme).surface,
+                border: `1px solid ${getTheme(deck?.theme).border}`,
+                "--lh-ink": getTheme(deck?.theme).ink,
+                "--lh-ink-soft": getTheme(deck?.theme).inkSoft,
+                "--lh-paper": getTheme(deck?.theme).paper
+              }}
+            >
               <div className="h-full overflow-auto">
                 <SlideRender slide={slide} deck={deck} presenting={false} />
               </div>
@@ -5877,7 +6369,9 @@ function TeamPanel({ onClose }) {
 // ---------------------------------------------------------------------
 function PrintRegion({ deck }) {
   if (!deck) return null;
-  return (
+  // Render via portal directly to <body> so the print CSS that hides #root
+  // doesn't also hide our print content.
+  const content = (
     <div id="lh-print-region">
       {deck.slides.map((slide, i) => (
         <div
@@ -5910,6 +6404,7 @@ function PrintRegion({ deck }) {
       ))}
     </div>
   );
+  return createPortal(content, document.body);
 }
 
 // =====================================================================
@@ -6067,13 +6562,41 @@ async function exportToPptx(deck, deckTitle) {
 
 // PDF export = open print dialog with print-ready CSS targeting only the print region
 function exportToPdf() {
-  // Add a one-shot class on body that makes the print view appear and triggers the dialog
+  // Add the marker class so CSS reveals the print region
   document.body.classList.add("lh-printing");
-  // Give the browser a tick to apply CSS
-  setTimeout(() => {
-    window.print();
-    setTimeout(() => document.body.classList.remove("lh-printing"), 500);
-  }, 100);
+
+  // Wait until: (1) the next paint frame, (2) all visible images in the print region have loaded,
+  // (3) a brief settle delay. Then open the print dialog.
+  const printRegion = () => document.getElementById("lh-print-region");
+
+  const waitForImages = () => {
+    const region = printRegion();
+    if (!region) return Promise.resolve();
+    const imgs = Array.from(region.querySelectorAll("img"));
+    return Promise.all(imgs.map(img => {
+      if (img.complete && img.naturalWidth > 0) return Promise.resolve();
+      return new Promise(resolve => {
+        const done = () => resolve();
+        img.addEventListener("load", done, { once: true });
+        img.addEventListener("error", done, { once: true });
+        // Hard timeout so a slow/missing image doesn't block printing forever
+        setTimeout(done, 4000);
+      });
+    }));
+  };
+
+  // Two animation frames for layout + image wait + small settle
+  requestAnimationFrame(() => requestAnimationFrame(async () => {
+    try {
+      await waitForImages();
+      // small settle so fonts can swap in
+      await new Promise(r => setTimeout(r, 250));
+      window.print();
+    } finally {
+      // Remove the class after the print dialog closes (also a fallback in case)
+      setTimeout(() => document.body.classList.remove("lh-printing"), 500);
+    }
+  }));
 }
 
 // ---------------------------------------------------------------------
@@ -6145,10 +6668,17 @@ function ExportModal({ deck, onClose }) {
 // ---------------------------------------------------------------------
 // SHARE BUTTON — copies a deep link to this deck
 // ---------------------------------------------------------------------
-function ShareDeckButton({ deckId }) {
+// ---------------------------------------------------------------------
+// SHARE BUTTON — copies a deep link. If the deck is published publicly,
+// the link is the public viewer link (no login needed). Otherwise it's
+// the private team link.
+// ---------------------------------------------------------------------
+function ShareDeckButton({ deckId, isPublished }) {
   const [copied, setCopied] = useState(false);
   const handle = () => {
-    const link = `${window.location.origin}${window.location.pathname}?deck=${encodeURIComponent(deckId)}`;
+    const link = isPublished
+      ? `${window.location.origin}${window.location.pathname}?public=${encodeURIComponent(deckId)}`
+      : `${window.location.origin}${window.location.pathname}?deck=${encodeURIComponent(deckId)}`;
     if (navigator.clipboard && navigator.clipboard.writeText) {
       navigator.clipboard.writeText(link).then(() => {
         setCopied(true);
@@ -6161,9 +6691,218 @@ function ShareDeckButton({ deckId }) {
     }
   };
   return (
-    <button onClick={handle} className="px-4 py-2 rounded-full text-sm font-semibold flex items-center gap-1.5 text-stone-700 bg-stone-100 hover:bg-stone-200 transition" style={{ fontFamily: "Manrope, sans-serif" }} title="Copy a direct link to this workshop">
-      {copied ? <><Check size={14} style={{ color: BRAND.green }} /> Copied!</> : <><Share2 size={14} /> Share</>}
+    <button
+      onClick={handle}
+      className="px-4 py-2 rounded-full text-sm font-semibold flex items-center gap-1.5 transition"
+      style={{
+        fontFamily: "Manrope, sans-serif",
+        background: isPublished ? `${BRAND.green}20` : "#F5F5F4",
+        color: isPublished ? BRAND.greenDeep : "#44403C"
+      }}
+      title={isPublished ? "Copy public link (no login required)" : "Copy team link (login required)"}
+    >
+      {copied
+        ? <><Check size={14} /> Copied!</>
+        : <><Share2 size={14} /> Share {isPublished ? "(public)" : ""}</>}
     </button>
+  );
+}
+
+// ---------------------------------------------------------------------
+// PUBLISH TOGGLE — controls whether a deck has a publicly viewable link
+// ---------------------------------------------------------------------
+function PublishToggle({ deck, deckId, onPublishChange }) {
+  const auth = useAuth();
+  const [busy, setBusy] = useState(false);
+  const [isPublished, setIsPublished] = useState(false);
+  const [loaded, setLoaded] = useState(false);
+
+  // Check publication status on mount and when deck changes
+  useEffect(() => {
+    if (!auth?.supabase) { setLoaded(true); return; }
+    let live = true;
+    (async () => {
+      const { data } = await auth.supabase
+        .from("public_decks")
+        .select("deck_id")
+        .eq("deck_id", deckId)
+        .maybeSingle();
+      if (live) {
+        setIsPublished(!!data);
+        setLoaded(true);
+        onPublishChange && onPublishChange(!!data);
+      }
+    })();
+    return () => { live = false; };
+  }, [deckId]);
+
+  const togglePublish = async () => {
+    if (!auth?.supabase) return;
+    setBusy(true);
+    try {
+      if (isPublished) {
+        // Unpublish — remove from public_decks
+        const { error } = await auth.supabase.from("public_decks").delete().eq("deck_id", deckId);
+        if (error) throw error;
+        setIsPublished(false);
+        onPublishChange && onPublishChange(false);
+      } else {
+        // Publish — upsert deck snapshot
+        const { error } = await auth.supabase.from("public_decks").upsert({
+          deck_id: deckId,
+          snapshot: deck,
+          published_by: auth.session.user.id,
+          published_at: new Date().toISOString(),
+          updated_at: new Date().toISOString()
+        }, { onConflict: "deck_id" });
+        if (error) throw error;
+        setIsPublished(true);
+        onPublishChange && onPublishChange(true);
+      }
+    } catch (e) {
+      console.error("Publish error:", e);
+      alert("Couldn't update public version: " + e.message);
+    }
+    setBusy(false);
+  };
+
+  // If deck is published, also push updates to public_decks when deck changes
+  useEffect(() => {
+    if (!isPublished || !auth?.supabase || !loaded) return;
+    const t = setTimeout(async () => {
+      try {
+        await auth.supabase.from("public_decks").upsert({
+          deck_id: deckId,
+          snapshot: deck,
+          published_by: auth.session.user.id,
+          published_at: new Date().toISOString(),
+          updated_at: new Date().toISOString()
+        }, { onConflict: "deck_id" });
+      } catch (e) { /* silent — sync best-effort */ }
+    }, 1500);
+    return () => clearTimeout(t);
+  }, [deck, isPublished]);
+
+  if (!loaded) return null;
+
+  return (
+    <button
+      onClick={togglePublish}
+      disabled={busy}
+      className="px-4 py-2 rounded-full text-sm font-semibold flex items-center gap-1.5 transition"
+      style={{
+        fontFamily: "Manrope, sans-serif",
+        background: isPublished ? `${BRAND.green}` : "#F5F5F4",
+        color: isPublished ? "white" : "#44403C"
+      }}
+      title={isPublished ? "Currently published — click to make private again" : "Click to publish a public viewable copy"}
+    >
+      {busy ? <Loader2 size={14} className="animate-spin" /> : isPublished ? <Eye size={14} /> : <EyeOff size={14} />}
+      {isPublished ? "Published" : "Publish to web"}
+    </button>
+  );
+}
+
+// ---------------------------------------------------------------------
+// DECK SETTINGS DROPDOWN — theme, transition, bullet animation
+// ---------------------------------------------------------------------
+function DeckSettingsDropdown({ deck, onChange }) {
+  const [open, setOpen] = useState(false);
+  const currentTheme = deck?.theme || "default";
+  const currentTransition = deck?.transition || "smooth";
+  const currentBulletAnim = deck?.bulletAnim || "all";
+
+  const setField = (field, value) => onChange({ ...deck, [field]: value });
+
+  return (
+    <div className="relative">
+      <button
+        onClick={() => setOpen(v => !v)}
+        className="px-4 py-2 rounded-full text-sm font-semibold flex items-center gap-1.5 text-stone-700 bg-stone-100 hover:bg-stone-200 transition"
+        style={{ fontFamily: "Manrope, sans-serif" }}
+        title="Theme, transitions, and presentation settings"
+      >
+        <Sparkles size={14} /> Style
+      </button>
+      {open && (
+        <>
+          <div className="fixed inset-0 z-30" onClick={() => setOpen(false)} />
+          <div className="absolute right-0 top-full mt-2 w-80 bg-white border border-stone-200 rounded-2xl shadow-xl p-4 z-40" onClick={e => e.stopPropagation()}>
+            {/* THEME */}
+            <div className="mb-5">
+              <div className="text-[10px] font-bold uppercase tracking-widest text-stone-500 mb-2.5">Theme</div>
+              <div className="grid grid-cols-1 gap-1.5">
+                {Object.values(THEMES).map(t => (
+                  <button
+                    key={t.id}
+                    onClick={() => setField("theme", t.id)}
+                    className={`flex items-center gap-3 p-2 rounded-xl border-2 transition text-left ${currentTheme === t.id ? "border-stone-900 bg-stone-50" : "border-transparent hover:bg-stone-50"}`}
+                  >
+                    {/* Color preview */}
+                    <div className="flex shrink-0 rounded-md overflow-hidden border border-stone-200" style={{ width: 36, height: 24 }}>
+                      <div style={{ background: t.bg, width: 12 }} />
+                      <div style={{ background: t.accent, width: 12 }} />
+                      <div style={{ background: t.accent2, width: 12 }} />
+                    </div>
+                    <div className="min-w-0 flex-1">
+                      <div className="text-sm font-semibold text-stone-900">{t.name}</div>
+                      <div className="text-xs text-stone-500 truncate">{t.description}</div>
+                    </div>
+                    {currentTheme === t.id && <Check size={14} style={{ color: BRAND.green }} className="shrink-0" />}
+                  </button>
+                ))}
+              </div>
+            </div>
+
+            {/* TRANSITION */}
+            <div className="mb-5">
+              <div className="text-[10px] font-bold uppercase tracking-widest text-stone-500 mb-2.5">Slide transitions</div>
+              <div className="grid grid-cols-2 gap-1.5">
+                <button
+                  onClick={() => setField("transition", "smooth")}
+                  className={`p-2.5 rounded-lg border-2 transition text-xs font-semibold ${currentTransition === "smooth" ? "border-stone-900 bg-stone-50" : "border-stone-200 hover:bg-stone-50"}`}
+                >
+                  <div className="text-stone-900">Smooth</div>
+                  <div className="text-[10px] text-stone-500 mt-0.5 font-normal">Subtle fade</div>
+                </button>
+                <button
+                  onClick={() => setField("transition", "lively")}
+                  className={`p-2.5 rounded-lg border-2 transition text-xs font-semibold ${currentTransition === "lively" ? "border-stone-900 bg-stone-50" : "border-stone-200 hover:bg-stone-50"}`}
+                >
+                  <div className="text-stone-900">Lively</div>
+                  <div className="text-[10px] text-stone-500 mt-0.5 font-normal">Zoom + bounce</div>
+                </button>
+              </div>
+            </div>
+
+            {/* BULLET ANIMATION */}
+            <div>
+              <div className="text-[10px] font-bold uppercase tracking-widest text-stone-500 mb-2.5">Bullets in presentation mode</div>
+              <div className="grid grid-cols-2 gap-1.5">
+                <button
+                  onClick={() => setField("bulletAnim", "all")}
+                  className={`p-2.5 rounded-lg border-2 transition text-xs font-semibold ${currentBulletAnim === "all" ? "border-stone-900 bg-stone-50" : "border-stone-200 hover:bg-stone-50"}`}
+                >
+                  <div className="text-stone-900">All at once</div>
+                  <div className="text-[10px] text-stone-500 mt-0.5 font-normal">Show all bullets</div>
+                </button>
+                <button
+                  onClick={() => setField("bulletAnim", "click")}
+                  className={`p-2.5 rounded-lg border-2 transition text-xs font-semibold ${currentBulletAnim === "click" ? "border-stone-900 bg-stone-50" : "border-stone-200 hover:bg-stone-50"}`}
+                >
+                  <div className="text-stone-900">One at a time</div>
+                  <div className="text-[10px] text-stone-500 mt-0.5 font-normal">Click to reveal</div>
+                </button>
+              </div>
+            </div>
+
+            <div className="text-[10px] text-stone-400 mt-4 leading-relaxed">
+              These settings apply to this workshop only. Changes save automatically and sync to your team.
+            </div>
+          </div>
+        </>
+      )}
+    </div>
   );
 }
 
@@ -6996,6 +7735,254 @@ function RecordingsPanel({ deckId, deckTitle }) {
           onUploaded={() => { /* realtime will update list */ }}
         />
       )}
+    </div>
+  );
+}
+
+// =====================================================================
+// PUBLIC VIEWER — read-only viewer for /?public=DECK_ID
+// No login required. Shows the deck with Present + Download only.
+// =====================================================================
+function PublicViewer({ deckId }) {
+  // Use a separate, anonymous supabase client so we don't need a signed-in session
+  const [supa] = useState(() => SUPABASE_CONFIGURED
+    ? createClient(LH_CFG.SUPABASE_URL, LH_CFG.SUPABASE_ANON_KEY, {
+        auth: { persistSession: false, autoRefreshToken: false }
+      })
+    : null);
+
+  const [deck, setDeck] = useState(null);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState(null);
+  const [presenting, setPresenting] = useState(false);
+  const [showExport, setShowExport] = useState(false);
+  const [activeIdx, setActiveIdx] = useState(0);
+
+  // Add noindex meta tag — public viewer pages should NOT show up in search
+  useEffect(() => {
+    if (document.getElementById("lh-noindex")) return;
+    const m = document.createElement("meta");
+    m.id = "lh-noindex";
+    m.name = "robots";
+    m.content = "noindex, nofollow";
+    document.head.appendChild(m);
+    return () => { const el = document.getElementById("lh-noindex"); if (el) el.remove(); };
+  }, []);
+
+  // Load the deck from public_decks
+  useEffect(() => {
+    if (!supa || !deckId) { setLoading(false); return; }
+    let live = true;
+    (async () => {
+      try {
+        const { data, error: err } = await supa
+          .from("public_decks")
+          .select("snapshot, published_at, updated_at")
+          .eq("deck_id", deckId)
+          .maybeSingle();
+        if (!live) return;
+        if (err) throw err;
+        if (!data) {
+          setError("This presentation isn't published, or the link is incorrect.");
+        } else {
+          setDeck(data.snapshot);
+        }
+      } catch (e) {
+        if (live) setError(e.message || "Couldn't load this presentation.");
+      } finally {
+        if (live) setLoading(false);
+      }
+    })();
+    return () => { live = false; };
+  }, [supa, deckId]);
+
+  // Inject fonts (App does it but we render before App)
+  useEffect(() => {
+    if (document.getElementById("lh-fonts")) return;
+    const link = document.createElement("link");
+    link.id = "lh-fonts";
+    link.rel = "stylesheet";
+    link.href = "https://fonts.googleapis.com/css2?family=Fraunces:ital,opsz,wght@0,9..144,300..700;1,9..144,300..700&family=Manrope:wght@400;500;600;700&display=swap";
+    document.head.appendChild(link);
+  }, []);
+
+  // ---- LOADING ----
+  if (loading) {
+    return (
+      <div style={{ minHeight: "100vh", display: "flex", alignItems: "center", justifyContent: "center", background: "#FAF6EE" }}>
+        <Loader2 size={28} className="animate-spin" style={{ color: "#5B2D8A" }} />
+      </div>
+    );
+  }
+
+  // ---- ERROR ----
+  if (error || !deck) {
+    return (
+      <div style={{ minHeight: "100vh", display: "flex", alignItems: "center", justifyContent: "center", padding: "24px", background: "#FAF6EE" }}>
+        <div style={{ maxWidth: "480px", width: "100%", background: "white", border: "1px solid #E6DFD0", borderRadius: "20px", padding: "36px 32px", textAlign: "center", fontFamily: "Manrope, sans-serif" }}>
+          <div style={{ fontFamily: "Fraunces, Georgia, serif", fontSize: "30px", fontWeight: 600, letterSpacing: "-0.02em", color: "#3E1E62", marginBottom: "6px" }}>
+            life<span style={{ color: "#1FAE7C" }}>house</span>
+          </div>
+          <div style={{ fontFamily: "Fraunces, Georgia, serif", fontStyle: "italic", color: "#6B6056", fontSize: "13px", marginBottom: "28px" }}>
+            "Home, for good."
+          </div>
+          <div style={{ marginBottom: "20px" }}>
+            <AlertCircle size={32} style={{ color: "#A86A1F", margin: "0 auto" }} />
+          </div>
+          <h2 style={{ fontFamily: "Fraunces, Georgia, serif", fontSize: "22px", color: "#1A1410", margin: "0 0 12px" }}>
+            Presentation not available
+          </h2>
+          <p style={{ color: "#6B6056", fontSize: "14px", lineHeight: 1.55, margin: "0 0 20px" }}>
+            {error || "This presentation isn't published, or the link is incorrect."}
+          </p>
+          <p style={{ color: "#9A8E80", fontSize: "12px", lineHeight: 1.55 }}>
+            If you're a Life House team member, <a href={window.location.pathname} style={{ color: "#3E1E62", textDecoration: "underline" }}>sign in here</a> to access the full library.
+          </p>
+        </div>
+      </div>
+    );
+  }
+
+  const total = deck.slides.length;
+  const slide = deck.slides[activeIdx] || deck.slides[0];
+  const themeId = deck.theme || "default";
+  const t = getTheme(themeId);
+  const isDark = t.bg.startsWith("#1") || t.bg.startsWith("#2");
+
+  return (
+    <div style={{ minHeight: "100vh", background: "#FAF6EE", fontFamily: "Manrope, sans-serif", color: "#1A1410", display: "flex", flexDirection: "column" }}>
+      {/* HEADER — branded but minimal */}
+      <header className="border-b border-stone-200" style={{ background: "rgba(250,246,238,0.92)", backdropFilter: "blur(8px)" }}>
+        <div className="max-w-6xl mx-auto px-6 lg:px-10 py-4 flex items-center justify-between gap-4">
+          <div className="flex items-center gap-3">
+            <div style={{ fontFamily: "Fraunces, Georgia, serif", fontSize: "22px", fontWeight: 600, letterSpacing: "-0.02em", color: "#3E1E62", lineHeight: 1 }}>
+              life<span style={{ color: "#1FAE7C" }}>house</span>
+            </div>
+            <div className="hidden sm:block h-6 w-px bg-stone-300" />
+            <div className="hidden sm:flex items-center gap-1.5 text-[10px] font-bold uppercase tracking-widest" style={{ color: "#1FAE7C" }}>
+              <Eye size={11} /> Public preview
+            </div>
+          </div>
+          <div className="flex items-center gap-2">
+            <button
+              onClick={() => setShowExport(true)}
+              className="px-4 py-2 rounded-full text-sm font-semibold flex items-center gap-1.5 text-stone-700 bg-stone-100 hover:bg-stone-200 transition"
+              title="Download this presentation"
+            >
+              <Download size={14} /> Download
+            </button>
+            <button
+              onClick={() => setPresenting(true)}
+              className="px-5 py-2 rounded-full text-sm font-semibold text-white flex items-center gap-2 transition shadow-sm"
+              style={{ background: "#3E1E62" }}
+            >
+              <Maximize2 size={14} /> Present
+            </button>
+          </div>
+        </div>
+      </header>
+
+      {/* DECK HERO */}
+      <div className="max-w-6xl mx-auto w-full px-6 lg:px-10 py-10">
+        <div className="text-xs font-bold uppercase tracking-widest mb-3" style={{ color: "#1FAE7C" }}>
+          Life House Reentry Workshop
+        </div>
+        <h1 style={{ fontFamily: "Fraunces, Georgia, serif", fontSize: "48px", fontWeight: 500, letterSpacing: "-0.02em", color: "#1A1410", lineHeight: 1.05, margin: "0 0 12px" }}>
+          {deck.title}
+        </h1>
+        {deck.tagline && (
+          <p style={{ fontFamily: "Fraunces, Georgia, serif", fontStyle: "italic", color: "#3E1E62", fontSize: "20px", margin: "0 0 18px", maxWidth: "44rem", lineHeight: 1.4 }}>
+            {deck.tagline}
+          </p>
+        )}
+        <div className="text-sm text-stone-500" style={{ fontFamily: "Manrope, sans-serif" }}>
+          {total} slide{total === 1 ? "" : "s"} · Click "Present" to view in full screen
+        </div>
+      </div>
+
+      {/* SLIDE BROWSER */}
+      <div className="flex-1 max-w-6xl mx-auto w-full px-6 lg:px-10 pb-12 flex gap-6">
+        {/* Slide rail */}
+        <div className="w-60 shrink-0 overflow-auto" style={{ maxHeight: "calc(100vh - 200px)" }}>
+          <div className="space-y-2">
+            {deck.slides.map((s, i) => (
+              <button
+                key={i}
+                onClick={() => setActiveIdx(i)}
+                className={`w-full text-left p-3 rounded-xl transition border-2 ${i === activeIdx ? "bg-white border-stone-900" : "bg-stone-50 hover:bg-stone-100 border-transparent"}`}
+              >
+                <div className="flex items-center gap-2 mb-1">
+                  <span className="text-[10px] font-bold text-stone-400 tracking-widest">{String(i + 1).padStart(2, "0")}</span>
+                  <span className="text-[10px] font-semibold uppercase tracking-wider" style={{ color: "#5B2D8A" }}>
+                    {SLIDE_KIND_LABELS[s.kind] || s.kind}
+                  </span>
+                </div>
+                <div style={{ fontFamily: "Fraunces, Georgia, serif" }} className="text-sm text-stone-800 leading-snug line-clamp-2">
+                  {s.title || s.hook || s.name || s.prompt || (s.items && itemText(s.items[0])) || s.body || s.caption || (s.kind === "video" ? "Video" : s.kind === "image" ? "Image" : "(empty)")}
+                </div>
+              </button>
+            ))}
+          </div>
+        </div>
+
+        {/* Active slide preview */}
+        <div className="flex-1 min-w-0">
+          <div
+            data-theme-mode={isDark ? "dark" : "light"}
+            className="aspect-video rounded-2xl shadow-md overflow-hidden relative"
+            style={{
+              background: t.surface,
+              border: `1px solid ${t.border}`,
+              "--lh-ink": t.ink,
+              "--lh-ink-soft": t.inkSoft,
+              "--lh-paper": t.paper
+            }}
+          >
+            <SlideRender slide={slide} deck={deck} presenting={false} />
+          </div>
+          <div className="mt-4 flex items-center justify-between text-sm text-stone-500" style={{ fontFamily: "Manrope, sans-serif" }}>
+            <button
+              onClick={() => setActiveIdx(i => Math.max(0, i - 1))}
+              disabled={activeIdx === 0}
+              className="px-3 py-1.5 rounded-full hover:bg-stone-100 transition disabled:opacity-30 flex items-center gap-1"
+            >
+              <ChevronLeft size={14} /> Previous
+            </button>
+            <span>Slide {activeIdx + 1} of {total}</span>
+            <button
+              onClick={() => setActiveIdx(i => Math.min(total - 1, i + 1))}
+              disabled={activeIdx === total - 1}
+              className="px-3 py-1.5 rounded-full hover:bg-stone-100 transition disabled:opacity-30 flex items-center gap-1"
+            >
+              Next <ChevronRight size={14} />
+            </button>
+          </div>
+        </div>
+      </div>
+
+      {/* FOOTER */}
+      <footer className="border-t border-stone-200 py-6 px-6 lg:px-10" style={{ background: "#FAF6EE" }}>
+        <div className="max-w-6xl mx-auto flex flex-col sm:flex-row items-start sm:items-center justify-between gap-3 text-xs text-stone-500">
+          <div>
+            <span style={{ fontFamily: "Fraunces, Georgia, serif", fontStyle: "italic" }}>"Home, for good."</span>
+            {" — "}
+            <a href="https://lifehousereentry.com" target="_blank" rel="noopener noreferrer" style={{ color: "#3E1E62", fontWeight: 600 }}>
+              lifehousereentry.com
+            </a>
+          </div>
+          <div className="flex items-center gap-4">
+            <span>855-4-LIFEUP</span>
+            <a href="mailto:julius@lifehousereentry.com" className="hover:text-stone-900">julius@lifehousereentry.com</a>
+          </div>
+        </div>
+      </footer>
+
+      {/* MODALS */}
+      {presenting && <Presentation deck={deck} onClose={() => setPresenting(false)} />}
+      {showExport && <ExportModal deck={deck} onClose={() => setShowExport(false)} />}
+
+      {/* PRINT REGION (so PDF download works) */}
+      <PrintRegion deck={deck} />
     </div>
   );
 }
