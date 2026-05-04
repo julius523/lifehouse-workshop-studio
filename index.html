@@ -131,7 +131,7 @@
       Video, Mic, MicOff, VideoOff, Square, Circle, Upload, Trash2,
       Play, Pause, Monitor, Camera, FileVideo, Download,
       Image, ImagePlus, ImageOff, ExternalLink,
-      Share2, Link as LinkIcon, Copy, FileText, Presentation, GripVertical
+      Share2, Link as LinkIcon, Copy, FileText, Presentation as PresentationIcon, GripVertical
     } from "lucide-react";
     import { createClient } from "@supabase/supabase-js";
     import PptxGenJS from "pptxgenjs";
@@ -6123,7 +6123,7 @@ function ExportModal({ deck, onClose }) {
 
             <button onClick={handlePptx} disabled={pptxBusy} className="w-full text-left p-4 rounded-2xl border-2 border-stone-200 hover:border-stone-900 transition flex items-center gap-4 group disabled:opacity-60">
               <div className="w-12 h-12 rounded-xl flex items-center justify-center shrink-0" style={{ background: `${BRAND.amber}20`, color: "#A86A1F" }}>
-                <Presentation size={20} />
+                <PresentationIcon size={20} />
               </div>
               <div className="flex-1">
                 <div className="font-semibold text-stone-900">Download as PowerPoint</div>
